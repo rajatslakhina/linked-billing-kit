@@ -510,6 +510,41 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.admission(at: t0 + 2_100), .probe) // not blocked for probeTimeoutMillis
     }
 
+    func testAConnectedReadAfterAReadDetectedUnlinkStartsTheNewConnectionFresh() {
+        // A 403 reveals the unlink, a read confirms it, and the customer relinks somewhere
+        // this state never sees; a later read says connected. Every arrival order must
+        // give a billable link with no stale probe or backoff. `d` is a second 403 sent
+        // between the two reads (the link was still down).
+        let disconnected = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
+        let orders: [[Int]] = [[0, 1, 2, 3], [0, 1, 3, 2], [0, 3, 2, 1], [1, 2, 0, 3], [2, 1, 3, 0],
+                               [3, 2, 1, 0], [2, 3, 0, 1], [1, 3, 0, 2]]
+        for order in orders {
+            var state = billableLink()
+            let a = state.issueTicket(), b = state.issueTicket(), d = state.issueTicket(), c = state.issueTicket()
+            let events: [LinkEvent] = [
+                .customerRefused(.notBillable, ticket: a, sentAt: t0),
+                .statusObserved(disconnected, ticket: b),
+                .statusObserved(.connected, ticket: c),
+                .customerRefused(.notBillable, ticket: d, sentAt: t0 + 1),
+            ]
+            for (offset, index) in order.enumerated() { state.apply(events[index], at: t0 + 10 + Int64(offset)) }
+            XCTAssertEqual(state.phase, .linked(.billable), "order \(order)")
+            XCTAssertEqual(state.admission(at: t0 + 20), .admit, "order \(order)")
+            XCTAssertFalse(state.probeInFlight, "order \(order)")
+            // The new connection's own outcomes still count, with a fresh backoff.
+            state.apply(.customerRefused(.spendLimitReached, ticket: state.issueTicket()), at: t0 + 30)
+            XCTAssertEqual(state.phase, .linked(.spendLimitReached(resetsAt: BillingMonth(containing: t0 + 30).end,
+                                                                   nextProbeAt: t0 + 30 + 15 * 60_000)), "order \(order)")
+        }
+    }
+
+    func testAConnectedReadWithoutANegativeReadKeepsRequestObservedHealth() {
+        var state = billableLink()
+        state.apply(.customerRefused(.notBillable, ticket: state.issueTicket()), at: t0)
+        state.apply(.statusObserved(.connected, ticket: state.issueTicket()), at: t0 + 1)
+        guard case .linked(.notBillable) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
     func testAReapprovalDoesNotMakeInFlightRequestOutcomesStale() {
         var state = billableLink()
         let request = state.issueTicket()

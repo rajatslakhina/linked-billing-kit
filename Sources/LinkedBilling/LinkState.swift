@@ -161,7 +161,10 @@ public enum LinkEvent: Hashable, Sendable {
 /// 3. While degraded, at most one probe is in flight; a lost probe expires.
 /// 4. `spend_limit_reached` is never probed later than 00:00 UTC on the 1st.
 /// 5. `connection_status` of `unknown` never changes state; `connected` never
-///    overrides request-observed health; between a negative read and a request that
+///    overrides request-observed health, except that a `connected` read issued after
+///    a negative read *and* after the newest request outcome marks a new connection
+///    (the customer relinked somewhere this state didn't see), so health, probe and
+///    backoff start fresh, whatever order those results land in; between a negative read and a request that
 ///    proved the connection alive (a success, a 402 or a `connected` read), the one
 ///    issued later decides
 ///    whether the link reads as unlinked, in any arrival order.
@@ -192,6 +195,8 @@ public struct LinkState: Sendable {
     /// `connected` read. (That a 402 implies a live connection is inferred from the
     /// docs, which refuse ended or unlinked connections with 403 `not_billable`.)
     private var connectedEvidence = Ticket(sequence: 0)
+    /// Newest `connected` read applied (a subset of `connectedEvidence`).
+    private var latestConnectedRead = Ticket(sequence: 0)
     /// Newest `disconnected` / `not_connected` read since the last link/unlink action.
     private var negativeRead: (ticket: Ticket, status: ConnectionStatus, at: EpochMillis)?
     private var probe: (ticket: Ticket, startedAt: EpochMillis)?
@@ -409,7 +414,21 @@ public struct LinkState: Sendable {
         case let .probeAbandoned(ticket):
             if probe?.ticket == ticket { clearProbe(resetFailures: false) }
         }
+        startFreshIfReconnected()
         return phase(at: now) != before
+    }
+
+    /// A negative read followed by a later-issued `connected` read means the connection
+    /// ended and a new one began, so request outcomes issued before that `connected`
+    /// read describe the old connection. Checked after every event, so the result is
+    /// the same whichever result lands last, and it stops applying as soon as an
+    /// outcome issued after that `connected` read lands.
+    private mutating func startFreshIfReconnected() {
+        guard case .linked = base, let read = negativeRead,
+              read.ticket < latestConnectedRead, latestOutcome < latestConnectedRead else { return }
+        health = .billable
+        clearProbe(resetFailures: true)
+        warmupUntil = nil
     }
 
     private mutating func applyStatus(_ status: ConnectionStatus, ticket: Ticket, now: EpochMillis) {
@@ -417,8 +436,10 @@ public struct LinkState: Sendable {
         case .unknown:
             return
         case .connected:
-            // Positive evidence: outvotes any older negative read. It says nothing
-            // about billability, so health is left alone.
+            // Positive evidence: outvotes any older negative read. On its own it says
+            // nothing about billability, so health is left alone (but see
+            // `startFreshIfReconnected`).
+            latestConnectedRead = max(latestConnectedRead, ticket)
             connectedEvidence = max(connectedEvidence, ticket)
             switch base {
             case .linked, .pending:
