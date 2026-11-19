@@ -69,6 +69,14 @@ final class WireProtocolTests: XCTestCase {
                        .overloaded(retryAfterSeconds: 7))
     }
 
+    func testOnlyAnthropicsOverloadedErrorCountsAsUnbilled() {
+        // A 503 from a proxy, or without the error body, may have taken effect.
+        XCTAssertEqual(BillingRefusal.decode(status: 503, body: Data("<html>Service Unavailable</html>".utf8), retryAfterHeader: "5"),
+                       .other(status: 503, type: nil, code: nil))
+        XCTAssertEqual(BillingRefusal.decode(status: 503, body: body("api_error", nil)),
+                       .other(status: 503, type: "api_error", code: nil))
+    }
+
     func testABare403IsNotMistakenForAnUnlinkedCustomer() {
         // Same status and type, no billing code: an auth problem, not a link signal.
         let refusal = BillingRefusal.decode(status: 403, body: body("permission_error", nil))

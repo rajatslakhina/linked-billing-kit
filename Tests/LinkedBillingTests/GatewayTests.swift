@@ -229,6 +229,28 @@ final class GatewayTests: XCTestCase {
         guard case .served(_, .customer, _, _) = result.outcome else { return XCTFail("\(result.outcome)") }
     }
 
+    func testARetryAfterBeyondTheWaitCapFailsInsteadOfHolding() async {
+        let clock = ManualClock(start)
+        let org = SimulatedClaudeOrg(clock: clock)
+        await org.link()
+        await org.configure { $0.overloadNext = 1; $0.overloadRetryAfterSeconds = 3_600 }
+        let (gateway, _, _, sleeper) = make(clock: clock, org: org)
+        let result = await gateway.send(request())
+        XCTAssertEqual(result.outcome, .failed(.overloaded))
+        XCTAssertEqual(sleeper.requestedWaits, [])
+    }
+
+    func testOperationalUsageCarriesNoCustomerProfile() async {
+        let clock = ManualClock(start)
+        let org = SimulatedClaudeOrg(clock: clock)
+        await org.link()
+        let (gateway, _, _, _) = make(clock: clock, org: org)
+        let ops = FeatureDescriptor(id: "ops", displayName: "Ops", billing: .appOperational, model: "small")
+        _ = await gateway.send(InferenceRequest(feature: ops, estimate: MicroUSD(10_000), prompt: "p"))
+        let received = await org.received
+        XCTAssertEqual(received.map(\.profile), [nil])
+    }
+
     func testOverloadWithoutRetryAfterBacksOffAndGivesUp() async {
         let clock = ManualClock(start)
         let org = SimulatedClaudeOrg(clock: clock)
@@ -397,8 +419,18 @@ final class GatewayTests: XCTestCase {
         let first = Task { [req = request()] in await gateway.send(req) }
         await waitForPending(transport, 1)
         // The first request is in flight: nothing spent yet, but its reservation is held.
-        let second = Task { [req = request()] in await gateway.send(req) }
-        await settle()
+        let done = Flag()
+        let second = Task { [req = request()] () -> GatewayResult in
+            let result = await gateway.send(req)
+            await done.set()
+            return result
+        }
+        // Wait until the second request has either finished or reached the transport,
+        // so the assertion can't pass just because it hasn't run yet.
+        await waitUntil {
+            if await done.isSet { return true }
+            return await transport.pendingCount >= 2
+        }
         let inFlight = await transport.pendingCount
         XCTAssertEqual(inFlight, 1, "the second request must pause, not reach the transport")
         await expectResolved(transport, customer: false, with: .success(cost: MicroUSD(100_000), text: "ok"))
@@ -474,4 +506,9 @@ actor SlowTransport: MessagesTransport {
         guard !script.isEmpty else { throw Exhausted() }
         return script.removeFirst()
     }
+}
+
+actor Flag {
+    private(set) var isSet = false
+    func set() { isSet = true }
 }

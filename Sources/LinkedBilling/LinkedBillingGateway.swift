@@ -43,21 +43,29 @@ public protocol BillingSleeper: Sendable {
     func sleep(millis: Int64) async throws
 }
 
+/// Retry bounds for one `send`. Every field is clamped in `init` and again whenever
+/// it is set, so no value can make a loop range invalid or a wait unbounded.
 public struct RetryLimits: Hashable, Sendable {
     /// Hard ceiling on attempts per `send`, across every kind of retry and fallback.
-    public var maxAttempts: Int
+    public var maxAttempts: Int { didSet { maxAttempts = min(max(1, maxAttempts), 10) } }
     /// Retries after `503 overloaded_error`.
-    public var maxOverloadRetries: Int
+    public var maxOverloadRetries: Int { didSet { maxOverloadRetries = min(max(0, maxOverloadRetries), 5) } }
     /// Backoff after a 503 without a usable `retry-after`: base × 2^retry.
-    public var overloadBackoffMillis: Int64
+    public var overloadBackoffMillis: Int64 { didSet { overloadBackoffMillis = min(max(0, overloadBackoffMillis), 60_000) } }
+    /// The longest single wait a `send` will sit through for a 503. A `retry-after`
+    /// beyond it (the API may ask for up to an hour) fails the request as
+    /// `.overloaded` instead of holding the caller.
+    public var maxRetryWaitMillis: Int64 { didSet { maxRetryWaitMillis = min(max(0, maxRetryWaitMillis), 3_600_000) } }
     /// Delay before re-sending a `not_billable` refused inside the warm-up window.
-    public var warmupRetryMillis: Int64
+    public var warmupRetryMillis: Int64 { didSet { warmupRetryMillis = min(max(0, warmupRetryMillis), 10_000) } }
 
     public init(maxAttempts: Int = 4, maxOverloadRetries: Int = 2,
-                overloadBackoffMillis: Int64 = 500, warmupRetryMillis: Int64 = 2_000) {
+                overloadBackoffMillis: Int64 = 500, maxRetryWaitMillis: Int64 = 30_000,
+                warmupRetryMillis: Int64 = 2_000) {
         self.maxAttempts = min(max(1, maxAttempts), 10)
         self.maxOverloadRetries = min(max(0, maxOverloadRetries), 5)
         self.overloadBackoffMillis = min(max(0, overloadBackoffMillis), 60_000)
+        self.maxRetryWaitMillis = min(max(0, maxRetryWaitMillis), 3_600_000)
         self.warmupRetryMillis = min(max(0, warmupRetryMillis), 10_000)
     }
 }
@@ -99,7 +107,7 @@ public enum GatewayOutcome: Hashable, Sendable {
 public struct GatewayResult: Hashable, Sendable {
     public let outcome: GatewayOutcome
     public let attempts: [GatewayAttempt]
-    /// A `not_billable` refusal was seen. Its causes include an ended connection,
+    /// A `not_billable` refusal was seen outside the warm-up window. Its causes include an ended connection,
     /// which nothing notifies you about, so read `connection_status` soon.
     public let statusCheckRecommended: Bool
 }
@@ -177,7 +185,7 @@ public actor LinkedBillingGateway {
             GatewayResult(outcome: outcome, attempts: attempts, statusCheckRecommended: statusCheck)
         }
 
-        for _ in 0..<limits.maxAttempts {
+        for _ in 0..<max(1, limits.maxAttempts) {
             guard !Task.isCancelled else { return finish(.failed(.cancelled)) }
             let now = clock.now()
             let decision = decide(request, at: now, customerBlocked: customerBlocked)
@@ -225,8 +233,10 @@ public actor LinkedBillingGateway {
                     if refusal == .notBillable, !link.isWarmingUp { statusCheck = true }
 
                     if case let .overloaded(retryAfter) = refusal {
-                        guard overloadRetries < limits.maxOverloadRetries else { return finish(.failed(.overloaded)) }
                         let wait = overloadDelay(retryAfterSeconds: retryAfter, retry: overloadRetries)
+                        guard overloadRetries < limits.maxOverloadRetries, wait <= limits.maxRetryWaitMillis else {
+                            return finish(.failed(.overloaded))
+                        }
                         overloadRetries += 1
                         guard (try? await sleeper.sleep(millis: wait)) != nil else { return finish(.failed(.cancelled)) }
                         continue
@@ -256,7 +266,10 @@ public actor LinkedBillingGateway {
                 }
                 let result: TransportResult
                 do {
-                    result = try await transport.send(request, payer: .app, profile: profile, model: model)
+                    // Attribute app-paid usage to the customer it serves; the app's own
+                    // operational usage isn't theirs, so it carries no profile.
+                    let attributed = budget == .operational ? nil : profile
+                    result = try await transport.send(request, payer: .app, profile: attributed, model: model)
                 } catch {
                     ledger.record(featureID: request.feature.id, payer: .app, budget: budget, model: model,
                                   outcome: .unknown, reservation: reservation, at: clock.now())
@@ -276,8 +289,10 @@ public actor LinkedBillingGateway {
                     attempts.append(GatewayAttempt(decision: decision,
                                                    result: .refused(refusal, discardedPartialReply: partial != nil)))
                     if case let .overloaded(retryAfter) = refusal {
-                        guard overloadRetries < limits.maxOverloadRetries else { return finish(.failed(.overloaded)) }
                         let wait = overloadDelay(retryAfterSeconds: retryAfter, retry: overloadRetries)
+                        guard overloadRetries < limits.maxOverloadRetries, wait <= limits.maxRetryWaitMillis else {
+                            return finish(.failed(.overloaded))
+                        }
                         overloadRetries += 1
                         guard (try? await sleeper.sleep(millis: wait)) != nil else { return finish(.failed(.cancelled)) }
                         continue

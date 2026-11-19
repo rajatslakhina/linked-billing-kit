@@ -93,8 +93,16 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
     public var appRefusal: BillingRefusal?
     /// The next N status reads throw.
     public var failStatusReads = 0
-    /// Delay each `send` by this much real time, so concurrent sends overlap.
+    /// Delay each `send` by this much real time.
     public var sendLatencyNanos: UInt64 = 0
+    /// When set, each `send` waits until this many sends are inside `send` together,
+    /// or `holdDeadlineNanos` after the first one started waiting, whichever comes
+    /// first. That makes a burst's overlap real and measurable (`maxConcurrentSends`)
+    /// rather than a matter of scheduling luck, and the deadline means it never hangs.
+    public var holdUntilInFlight: Int?
+    public var holdDeadlineNanos: UInt64 = 500_000_000
+    private var held: [CheckedContinuation<Void, Never>] = []
+    private var holdGeneration = 0
     private var inFlight = 0
     /// The most sends that were inside `send` at the same moment.
     public private(set) var maxConcurrentSends = 0
@@ -109,6 +117,14 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
         connected = true
         everConnected = true
         connectedAt = clock.now()
+    }
+
+    private func releaseHeld(ifGeneration generation: Int? = nil) {
+        if let generation, generation != holdGeneration { return }
+        holdGeneration &+= 1
+        let waiting = held
+        held.removeAll()
+        for continuation in waiting { continuation.resume() }
     }
 
     /// Start measuring `maxConcurrentSends` afresh.
@@ -132,6 +148,21 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
         inFlight += 1
         maxConcurrentSends = max(maxConcurrentSends, inFlight)
         defer { inFlight -= 1 }
+        if let target = holdUntilInFlight {
+            if inFlight >= target {
+                releaseHeld()
+            } else {
+                if held.isEmpty {
+                    let generation = holdGeneration
+                    let deadline = holdDeadlineNanos
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: deadline)
+                        await self?.releaseHeld(ifGeneration: generation)
+                    }
+                }
+                await withCheckedContinuation { held.append($0) }
+            }
+        }
         if sendLatencyNanos > 0 { try await Task.sleep(nanoseconds: sendLatencyNanos) }
         received.append(Received(payer: payer, profile: profile, model: model, featureID: request.feature.id))
         let cost = model == request.feature.model

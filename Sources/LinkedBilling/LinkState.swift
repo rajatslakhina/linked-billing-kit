@@ -1,29 +1,33 @@
 /// Tunables for the link state machine. Defaults follow the Claude Platform docs
 /// where the docs give a number, and are labelled as this package's choice where not.
+/// Every field is clamped in `init` and again whenever it is set, so no value can
+/// produce a probe time in the past or an interval that overflows when doubled.
 public struct LinkPolicy: Hashable, Sendable {
     /// After a code exchange, `user_profile_not_billable` is retryable for about 10 s
     /// (docs). Refusals inside this window do not degrade the link.
-    public var warmupMillis: Int64
+    public var warmupMillis: Int64 { didSet { warmupMillis = min(max(0, warmupMillis), 120_000) } }
     /// First wait before re-trying the customer after `spend_limit_reached`. A
     /// customer can raise the cap or buy credit at any time, and the API does not
     /// tell you, so waiting for the month to end would subsidise them needlessly.
     /// (Package choice; a cap change takes about a minute to apply, per the docs.)
-    public var capProbeMillis: Int64
+    public var capProbeMillis: Int64 { didSet { capProbeMillis = max(1_000, capProbeMillis) } }
     /// First wait before re-trying after `billing_unavailable` or `not_billable`.
     /// (Package choice.)
-    public var refusalProbeMillis: Int64
+    public var refusalProbeMillis: Int64 { didSet { refusalProbeMillis = max(1_000, refusalProbeMillis) } }
     /// Probe intervals double after each failed probe, up to this ceiling.
-    public var maxProbeMillis: Int64
+    public var maxProbeMillis: Int64 { didSet { maxProbeMillis = max(1_000, maxProbeMillis) } }
     /// A probe that never reports (app killed, task cancelled) stops blocking further
-    /// probes after this long. (Package choice.)
-    public var probeTimeoutMillis: Int64
+    /// probes after this long. Set it above your transport's request timeout, or a
+    /// slow probe that is still running will be joined by a second one. (Package
+    /// choice: 10 min, above a long non-streaming Messages call.)
+    public var probeTimeoutMillis: Int64 { didSet { probeTimeoutMillis = max(1_000, probeTimeoutMillis) } }
 
     public init(
         warmupMillis: Int64 = 10_000,
         capProbeMillis: Int64 = 15 * 60_000,
         refusalProbeMillis: Int64 = 30 * 60_000,
         maxProbeMillis: Int64 = 6 * 3_600_000,
-        probeTimeoutMillis: Int64 = 2 * 60_000
+        probeTimeoutMillis: Int64 = 10 * 60_000
     ) {
         // Clamp to sane, non-negative values so a bad config cannot produce a
         // probe schedule in the past or an interval that overflows when doubled.
@@ -120,7 +124,8 @@ public enum LinkEvent: Hashable, Sendable {
 /// 4. `spend_limit_reached` is never probed later than 00:00 UTC on the 1st.
 /// 5. `connection_status` of `unknown` never changes state; `connected` never
 ///    overrides request-observed health; a `disconnected`/`not_connected` read issued
-///    before the success that made the link billable doesn't unlink it.
+///    before a request that proved the connection alive (a success or a 402) doesn't
+///    unlink it.
 public struct LinkState: Sendable {
     public private(set) var phase: LinkPhase
     public let policy: LinkPolicy
@@ -130,6 +135,10 @@ public struct LinkState: Sendable {
     private var authoritative = Ticket(sequence: 0)
     /// Ticket of the newest request outcome (success or billing refusal) applied.
     private var latestOutcome = Ticket(sequence: 0)
+    /// Ticket of the newest request that proves the connection was alive when it was
+    /// issued: a success, or a 402 (the API checks the connection before the cap and
+    /// the org's billing).
+    private var connectedEvidence = Ticket(sequence: 0)
     private var probe: (ticket: Ticket, startedAt: EpochMillis)?
     private var failedProbes: Int = 0
     private var everLinked: Bool
@@ -238,9 +247,9 @@ public struct LinkState: Sendable {
     }
 
     private mutating func applyStatus(_ status: ConnectionStatus, ticket: Ticket, now: EpochMillis) {
-        // A negative read issued before a request that the customer's org then paid
-        // for is older evidence than that success: don't let it unlink.
-        let olderThanASuccess = ticket < latestOutcome && phaseIsBillable
+        // A negative read issued before a request that proved the connection alive
+        // (paid for, or refused with a 402) is older evidence: don't let it unlink.
+        let olderThanEvidence = ticket < connectedEvidence
         switch status {
         case .unknown:
             return
@@ -257,7 +266,7 @@ public struct LinkState: Sendable {
                 phase = .linked(.billable)
             }
         case let .disconnected(_, reason):
-            if olderThanASuccess { return }
+            if olderThanEvidence { return }
             switch phase {
             case .linkPending:
                 return // the old link ended; the new one is in progress
@@ -269,7 +278,7 @@ public struct LinkState: Sendable {
                 phase = .unlinked(reason: reason, detectedAt: now)
             }
         case .notConnected:
-            if olderThanASuccess { return }
+            if olderThanEvidence { return }
             switch phase {
             case .linkPending, .notLinked:
                 return
@@ -287,6 +296,11 @@ public struct LinkState: Sendable {
             // hit one simply did not answer the question.
             if probe?.ticket == ticket { clearProbe(resetFailures: false) }
             return
+        }
+        // A 402 proves the connection was alive when the request was issued, even if
+        // the outcome itself turns out to be stale below.
+        if refusal == .spendLimitReached || refusal == .billingUnavailable {
+            connectedEvidence = max(connectedEvidence, ticket)
         }
         // Invariant 2: an outcome older than the newest applied one is stale.
         guard ticket > latestOutcome else {
@@ -308,7 +322,9 @@ public struct LinkState: Sendable {
 
         switch refusal {
         case .spendLimitReached:
-            let resetsAt = BillingMonth(containing: now).end
+            // The cap that refused it belongs to the month the request was sent in. If that
+            // month has already ended by arrival, `next` is due immediately.
+            let resetsAt = BillingMonth(containing: sentAt).end
             let next = min(Saturating.add(now, backoff(policy.capProbeMillis)), resetsAt)
             phase = .linked(.spendLimitReached(resetsAt: resetsAt, nextProbeAt: next))
         case .billingUnavailable:
@@ -322,6 +338,7 @@ public struct LinkState: Sendable {
 
     private mutating func applySuccess(ticket: Ticket, now: EpochMillis) {
         guard ticket > authoritative, case .linked = phase else { return }
+        connectedEvidence = max(connectedEvidence, ticket) // the org paid: it was connected
         // Invariant 2: only a request issued after the newest applied outcome counts.
         // (A stale success from before a degrading refusal is not evidence of recovery.)
         guard ticket > latestOutcome else {
@@ -331,11 +348,6 @@ public struct LinkState: Sendable {
         latestOutcome = ticket
         clearProbe(resetFailures: true)
         phase = .linked(.billable)
-    }
-
-    private var phaseIsBillable: Bool {
-        if case .linked(.billable) = phase { return true }
-        return false
     }
 
     private mutating func clearProbe(resetFailures: Bool) {

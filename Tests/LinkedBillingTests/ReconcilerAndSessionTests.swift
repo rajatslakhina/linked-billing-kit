@@ -239,8 +239,14 @@ final class LinkSessionTests: XCTestCase {
         XCTAssertEqual(session.handleCallback(try callback("code=a&state=\(state)"), at: 1_000 + 10 * 60_000 + 1),
                        .rejected(.expired))
         XCTAssertEqual(session.handleCallback(try callback("code=a&state=\(state)"), at: 2_000), .rejected(.alreadyUsed))
-        let early = try self.session(at: 5_000)
-        XCTAssertEqual(early.handleCallback(try callback("code=a&state=\(state)"), at: 4_999), .rejected(.expired))
+        // Earlier than createdAt by more than the 60 s skew tolerance.
+        let early = try self.session(at: 100_000)
+        XCTAssertEqual(early.handleCallback(try callback("code=a&state=\(state)"), at: 100_000 - 60_001), .rejected(.expired))
+    }
+
+    func testASmallClockAdjustmentIsTolerated() throws {
+        let session = try session(at: 100_000)
+        XCTAssertEqual(session.handleCallback(try callback("code=a&state=\(state)"), at: 100_000 - 59_000), .code("a"))
     }
 
     func testAForgedCallbackDuringClockSkewDoesNotBurnTheSession() throws {

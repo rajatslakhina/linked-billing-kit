@@ -116,8 +116,9 @@ public actor ScriptedMonth {
         case orgChange(@Sendable (isolated SimulatedClaudeOrg) -> Void)
         case consoleUnlink
         case request(Role, cents: Int64, times: Int)
-        /// Fired concurrently, with each simulated reply held for 50 ms so the sends
-        /// really overlap; the step's note reports how many were in flight at once.
+        /// Fired concurrently. The simulator holds each reply until every request that
+        /// is sent is in flight (or 0.5 s pass), so the overlap is real; the step's note
+        /// reports how many were in flight at once.
         case concurrentBurst(Role, cents: Int64, count: Int)
         case reconcileIfRecommended
     }
@@ -212,7 +213,7 @@ public actor ScriptedMonth {
                 let request = InferenceRequest(feature: feature, estimate: MicroUSD(Saturating.multiply(cents, 10_000)),
                                                prompt: "demo")
                 let gateway = self.gateway
-                await org.configure { $0.sendLatencyNanos = 50_000_000 }
+                await org.configure { $0.holdUntilInFlight = count }
                 await org.resetConcurrencyGauge()
                 let results = await withTaskGroup(of: GatewayResult.self) { group in
                     for _ in 0..<max(0, count) { group.addTask { await gateway.send(request) } }
@@ -221,7 +222,7 @@ public actor ScriptedMonth {
                     return collected
                 }
                 let peak = await org.maxConcurrentSends
-                await org.configure { $0.sendLatencyNanos = 0 }
+                await org.configure { $0.holdUntilInFlight = nil }
                 let served = results.filter(Self.isServed).count
                 note = "\(peak) of the \(served) sent requests were in flight at the same moment; their reservations kept the other \(results.count - served) from being sent."
                 // Served first, then paused, so the card reads in a stable order.

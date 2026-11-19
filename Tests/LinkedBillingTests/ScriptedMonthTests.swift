@@ -74,7 +74,8 @@ final class ScriptedMonthTests: XCTestCase {
         guard case .unlinked(.revokedByAdmin?, _) = steps[7].phaseAfter else { return XCTFail("\(steps[7].phaseAfter)") }
         // 9: concurrent burst: reservations let exactly three fit under $3.
         XCTAssertEqual(payers(steps[8]), ["app", "app", "app", "paused", "paused"])
-        // The three that were sent really overlapped (each reply is held for 50 ms).
+        // The three that were sent really overlapped (the simulator holds replies until
+        // all sent requests are in flight, or 0.5 s pass).
         XCTAssertTrue(steps[8].note?.hasPrefix("3 of the 3 sent requests were in flight at the same moment") ?? false,
                       steps[8].note ?? "no note")
         XCTAssertLessThanOrEqual(snapshots[8].thisMonth.appSubsidy, MicroUSD.dollars(3))

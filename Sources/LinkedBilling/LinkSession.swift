@@ -57,6 +57,10 @@ public final class LinkSession: @unchecked Sendable {
     public let redirect: Redirect
     public let createdAt: EpochMillis
     public let ttlMillis: Int64
+    /// How far the device clock may read *earlier* than `createdAt` before a callback
+    /// counts as expired. Pass `createdAt` from the same clock you pass as `now`; the
+    /// tolerance only absorbs small adjustments of that clock.
+    public let clockSkewToleranceMillis: Int64
     private let state: String
     private let lock = NSLock()
     private var consumed = false
@@ -66,7 +70,7 @@ public final class LinkSession: @unchecked Sendable {
     /// - Parameter state: the opaque value your back end put in the pushed request.
     ///   At least 22 characters (about 128 bits of base64url entropy).
     public init(authorizeURL: URL, state: String, redirect: Redirect, createdAt: EpochMillis,
-                ttlMillis: Int64 = 10 * 60_000,
+                ttlMillis: Int64 = 10 * 60_000, clockSkewToleranceMillis: Int64 = 60_000,
                 allowedHosts: Set<String> = LinkSession.defaultAllowedHosts) throws {
         guard let components = URLComponents(url: authorizeURL, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == "https" else { throw StartError.insecureScheme }
@@ -78,6 +82,7 @@ public final class LinkSession: @unchecked Sendable {
         self.redirect = redirect
         self.createdAt = createdAt
         self.ttlMillis = min(max(1_000, ttlMillis), 60 * 60_000)
+        self.clockSkewToleranceMillis = min(max(0, clockSkewToleranceMillis), 10 * 60_000)
     }
 
     /// Validate the callback.
@@ -107,7 +112,8 @@ public final class LinkSession: @unchecked Sendable {
               Self.constantTimeEquals(received, state) else { return .rejected(.stateMismatch) }
         // From here on the callback is provably ours, so every outcome consumes it.
         consumed = true
-        guard now >= createdAt, now <= Saturating.add(createdAt, ttlMillis) else { return .rejected(.expired) }
+        guard now >= Saturating.subtract(createdAt, clockSkewToleranceMillis),
+              now <= Saturating.add(createdAt, ttlMillis) else { return .rejected(.expired) }
 
         if let error = items.first(where: { $0.name == "error" })?.value {
             return .denied(error: error)

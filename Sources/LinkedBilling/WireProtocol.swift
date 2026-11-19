@@ -79,7 +79,7 @@ public enum BillingRefusal: Hashable, Sendable {
     /// monthly limit, or no usable credit; the response does not say which. Refused
     /// before Claude started a reply.
     case spendLimitReached
-    /// 503 `overloaded_error`: billing could not be confirmed. Retry with backoff,
+    /// 503 with error type `overloaded_error`: billing could not be confirmed. Retry with backoff,
     /// honouring `retry-after` (seconds). Not served, not billed.
     case overloaded(retryAfterSeconds: Int64?)
     /// 400 `user_profile_required`: a bug in the caller (missing profile header).
@@ -110,7 +110,10 @@ public enum BillingRefusal: Hashable, Sendable {
             return .billingUnavailable
         case (402, "billing_error", "linked_organization_spend_limit_reached"):
             return .spendLimitReached
-        case (503, _, _):
+        case (503, "overloaded_error", _):
+            // Only Anthropic's own overloaded_error promises "not served or billed".
+            // A 503 from a proxy or with a non-JSON body may have taken effect, so it
+            // falls through to `.other` and is never retried.
             return .overloaded(retryAfterSeconds: parseRetryAfter(retryAfterHeader))
         case (400, "invalid_request_error", "user_profile_required"):
             return .userProfileRequired

@@ -196,7 +196,9 @@ final class BillingRouterTests: XCTestCase {
         let tiny = FeatureDescriptor(id: "t", displayName: "T", model: "big", subsidyModel: SubsidyModel("small", costPercent: 1))
         XCTAssertEqual(BillingRouter.subsidyChoice(feature: tiny, estimate: MicroUSD(10)).1, MicroUSD(1))
         XCTAssertEqual(BillingRouter.subsidyChoice(feature: tiny, estimate: .zero).1, .zero)
-        XCTAssertEqual(BillingRouter.subsidyChoice(feature: chat, estimate: MicroUSD(.max)).1, MicroUSD(.max / 100))
+        // 20% of Int64.max, computed without saturating first: (max / 100) × 20 + (max % 100) × 20 / 100.
+        XCTAssertEqual(BillingRouter.subsidyChoice(feature: chat, estimate: MicroUSD(.max)).1, MicroUSD(1_844_674_407_370_955_161))
+        XCTAssertEqual(BillingRouter.subsidyChoice(feature: chat, estimate: MicroUSD(1_234_567)).1, MicroUSD(246_913))
         XCTAssertEqual(SubsidyModel("s", costPercent: 900).costPercent, 100)
         XCTAssertEqual(SubsidyModel("s", costPercent: -3).costPercent, 1)
     }

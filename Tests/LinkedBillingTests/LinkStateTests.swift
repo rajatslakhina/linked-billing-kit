@@ -130,8 +130,8 @@ final class LinkStateTests: XCTestCase {
         state.apply(.customerRefused(.notBillable, ticket: state.issueTicket()), at: t0)
         let due = t0 + 30 * 60_000
         XCTAssertTrue(state.beginProbe(ticket: state.issueTicket(), at: due))
-        XCTAssertEqual(state.admission(at: due + 2 * 60_000 - 1), .deny(.notBillable))
-        XCTAssertEqual(state.admission(at: due + 2 * 60_000), .probe)
+        XCTAssertEqual(state.admission(at: due + 10 * 60_000 - 1), .deny(.notBillable))
+        XCTAssertEqual(state.admission(at: due + 10 * 60_000), .probe)
     }
 
     func testAStragglerRefusalDoesNotCancelTheProbeInFlight() {
@@ -216,6 +216,16 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.admission(at: reset), .probe)
     }
 
+    func testASpendLimitSentBeforeMidnightResetsAtThatMidnight() {
+        var state = billableLink()
+        let sent = BillingMonth.epochMillis(year: 2026, month: 11, day: 30, hour: 23, minute: 59)
+        let arrived = BillingMonth.epochMillis(year: 2026, month: 12, day: 1, hour: 0, minute: 1)
+        state.apply(.customerRefused(.spendLimitReached, ticket: state.issueTicket(), sentAt: sent), at: arrived)
+        let november = BillingMonth.epochMillis(year: 2026, month: 12, day: 1)
+        XCTAssertEqual(state.phase, .linked(.spendLimitReached(resetsAt: november, nextProbeAt: november)))
+        XCTAssertEqual(state.admission(at: arrived), .probe) // that cap already reset
+    }
+
     func testSpendLimitProbesEarlyBecauseACapCanBeRaisedSilently() {
         var state = billableLink()
         state.apply(.customerRefused(.spendLimitReached, ticket: state.issueTicket()), at: t0)
@@ -267,6 +277,16 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.phase, .linked(.billable))
     }
 
+    func testANegativeReadOlderThanA402DoesNotUnlink() {
+        var state = billableLink()
+        let read = state.issueTicket()
+        let request = state.issueTicket()
+        // The API checks the connection before the cap, so this 402 proves it was alive.
+        state.apply(.customerRefused(.spendLimitReached, ticket: request), at: t0)
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: read), at: t0 + 1)
+        guard case .linked(.spendLimitReached) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
     func testNotConnectedAfterTheLinkMeansTheServerNeverSawIt() {
         var state = billableLink()
         state.apply(.statusObserved(.notConnected, ticket: state.issueTicket()), at: t0)
@@ -314,6 +334,21 @@ final class LinkStateTests: XCTestCase {
         XCTAssertFalse(state.apply(.customerBilled(ticket: state.issueTicket()), at: t0))
         XCTAssertFalse(state.apply(.customerRefused(.notBillable, ticket: state.issueTicket()), at: t0))
         XCTAssertEqual(state.phase, .notLinked)
+    }
+
+    func testPolicyAndRetryLimitsClampValuesSetAfterInit() {
+        var policy = LinkPolicy()
+        policy.warmupMillis = -1
+        policy.capProbeMillis = .min
+        policy.probeTimeoutMillis = 0
+        XCTAssertEqual(policy.warmupMillis, 0)
+        XCTAssertEqual(policy.capProbeMillis, 1_000)
+        XCTAssertEqual(policy.probeTimeoutMillis, 1_000)
+        var limits = RetryLimits()
+        limits.maxAttempts = -1          // would make `0..<maxAttempts` trap
+        limits.maxRetryWaitMillis = .max
+        XCTAssertEqual(limits.maxAttempts, 1)
+        XCTAssertEqual(limits.maxRetryWaitMillis, 3_600_000)
     }
 
     func testPolicyClampsHostileValues() {

@@ -3,8 +3,8 @@ public enum FeatureBilling: Hashable, Sendable {
     /// Usage the customer and their users cause in your product. The only kind the
     /// docs allow you to bill to the customer.
     case customerDirected
-    /// Your own usage (tests, evaluations, background moderation, work for other
-    /// customers). Never billed to the customer, whatever the link state.
+    /// Your own usage (tests, evaluations, background moderation). Never billed to the
+    /// customer, whatever the link state, and sent without their profile header.
     case appOperational
 }
 
@@ -177,7 +177,11 @@ public enum BillingRouter {
         // costPercent is clamped to 1...100, so the result never exceeds `estimate`;
         // a non-zero estimate never rounds down to a free request.
         guard estimate.value > 0 else { return (downgrade.model, .zero) }
-        let scaled = Saturating.multiply(estimate.value, downgrade.costPercent) / 100
+        // Divide before multiplying (with the remainder handled separately) so a huge
+        // estimate scales by the right percentage instead of saturating first.
+        let value = estimate.value
+        let scaled = Saturating.add(Saturating.multiply(value / 100, downgrade.costPercent),
+                                    (value % 100) * downgrade.costPercent / 100)
         return (downgrade.model, MicroUSD(max(1, scaled)))
     }
 }
