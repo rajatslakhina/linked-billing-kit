@@ -212,7 +212,7 @@ final class GatewayTests: XCTestCase {
         XCTAssertEqual(degraded.admission(at: clock.now()), .probe)
         let result = await gateway.send(request())
         XCTAssertEqual(result.outcome, .failed(.transportFailed))
-        // Without the abandon event the lost probe would block the next one for 2 min.
+        // Without the abandon event the lost probe would block the next one for 10 min (`probeTimeoutMillis`).
         let link = await gateway.link
         XCTAssertEqual(link.admission(at: clock.now()), .probe)
     }

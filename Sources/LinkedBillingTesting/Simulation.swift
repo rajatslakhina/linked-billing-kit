@@ -127,6 +127,16 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
         for continuation in waiting { continuation.resume() }
     }
 
+    /// One of the sends the hold is waiting for won't come (its request paused before
+    /// reaching the transport): lower the target, releasing the held sends if every
+    /// remaining one is now in flight.
+    public func lowerHoldTarget() {
+        guard let target = holdUntilInFlight else { return }
+        let lowered = max(1, target - 1)
+        holdUntilInFlight = lowered
+        if inFlight >= lowered { releaseHeld() }
+    }
+
     /// Start measuring `maxConcurrentSends` afresh.
     public func resetConcurrencyGauge() {
         maxConcurrentSends = inFlight

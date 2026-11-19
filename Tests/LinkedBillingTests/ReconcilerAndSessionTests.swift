@@ -135,7 +135,7 @@ final class PollScheduleTests: XCTestCase {
         func band(_ phase: LinkPhase) -> ClosedRange<Int64> {
             let base: Int64
             switch phase {
-            case .linkPending: base = 5_000
+            case .linkPending: base = 86_400_000
             case .linked(.notBillable): base = 300_000
             case .linked: base = 21_600_000
             case .notLinked, .unlinked: base = 86_400_000
@@ -184,7 +184,7 @@ final class PollScheduleTests: XCTestCase {
 
 final class LinkSessionTests: XCTestCase {
     let state = "s_" + String(repeating: "Ab3x", count: 6)
-    let redirect = LinkSession.Redirect(scheme: "myapp", host: "oauth", path: "/callback")
+    let redirect = LinkSession.Redirect(scheme: "https", host: "app.example.com", path: "/claude/billing/callback")
     let authorize = URL(string: "https://auth.claude.com/oauth/authorize?request_uri=urn:x")
 
     private func session(at createdAt: EpochMillis = 1_000) throws -> LinkSession {
@@ -192,7 +192,7 @@ final class LinkSessionTests: XCTestCase {
     }
 
     private func callback(_ query: String) throws -> URL {
-        try XCTUnwrap(URL(string: "myapp://oauth/callback?\(query)"))
+        try XCTUnwrap(URL(string: "https://app.example.com/claude/billing/callback?\(query)"))
     }
 
     func testTheAuthorizeURLMustBeHTTPSOnAnAllowedHost() throws {
@@ -258,7 +258,7 @@ final class LinkSessionTests: XCTestCase {
 
     func testCancelAndRedirectMismatchAreReported() throws {
         let session = try session()
-        let other = try XCTUnwrap(URL(string: "myapp://elsewhere/callback?code=a&state=\(state)"))
+        let other = try XCTUnwrap(URL(string: "https://evil.example/claude/billing/callback?code=a&state=\(state)"))
         XCTAssertEqual(session.handleCallback(other, at: 2_000), .rejected(.redirectMismatch))
         XCTAssertEqual(session.handleCallback(try callback("error=access_denied&state=\(state)"), at: 2_000),
                        .denied(error: "access_denied"))

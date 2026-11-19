@@ -11,11 +11,14 @@ public protocol ConnectionStatusSource: Sendable {
 /// Unlinking in the Claude Console sends you "no webhook event and no email" (docs),
 /// so polling is the only way to notice. Polling every profile every minute doesn't
 /// scale across a customer base, so the cadence follows the phase. It is fast where
-/// a change is likely and matters (a pending link, a link that just started refusing),
-/// and slow where nothing is expected. Every delay carries ±10% jitter so a fleet of
+/// a change is likely and matters (a link that just started refusing with
+/// `not_billable`), and slow where nothing is expected. A pending link isn't polled
+/// fast: no status read can complete it (only the code exchange does), and an
+/// abandoned flow expires on its own after `LinkPolicy.pendingTimeoutMillis`. Every delay carries ±10% jitter so a fleet of
 /// clients that started together doesn't poll in lockstep.
 public struct PollSchedule: Hashable, Sendable {
-    public var pendingMillis: Int64 = 5_000
+    /// A link flow in progress. Polled like an idle profile (see above).
+    public var pendingMillis: Int64 = 24 * 3_600_000
     /// Linked and `not_billable`: the most likely cause is an ended connection.
     public var suspectMillis: Int64 = 5 * 60_000
     /// Linked and either healthy or capped/unavailable (a status read can't fix those).

@@ -215,10 +215,16 @@ public actor ScriptedMonth {
                 let gateway = self.gateway
                 await org.configure { $0.holdUntilInFlight = count }
                 await org.resetConcurrencyGauge()
+                let org = self.org
                 let results = await withTaskGroup(of: GatewayResult.self) { group in
                     for _ in 0..<max(0, count) { group.addTask { await gateway.send(request) } }
                     var collected: [GatewayResult] = []
-                    for await result in group { collected.append(result) }
+                    for await result in group {
+                        // A paused request never reaches the transport, so the hold
+                        // stops waiting for it; the rest release once all are in flight.
+                        if !Self.isServed(result) { await org.lowerHoldTarget() }
+                        collected.append(result)
+                    }
                     return collected
                 }
                 let peak = await org.maxConcurrentSends
@@ -256,13 +262,13 @@ public actor ScriptedMonth {
         await gateway.apply(.linkStarted)
         let state = "st_" + String(repeating: "q7Xk", count: 6)
         guard let authorize = URL(string: "https://auth.claude.com/oauth/authorize?request_uri=urn:demo"),
-              let callback = URL(string: "linkedbillingdemo://oauth/callback?code=demo-code&state=\(state)"),
-              let forged = URL(string: "linkedbillingdemo://oauth/callback?code=evil&state=st_wrong-state-value-000000")
+              let callback = URL(string: "https://app.example.com/claude/billing/callback?code=demo-code&state=\(state)"),
+              let forged = URL(string: "https://app.example.com/claude/billing/callback?code=evil&state=st_wrong-state-value-000000")
         else { return "Could not build demo URLs." }
         do {
             let session = try LinkSession(
                 authorizeURL: authorize, state: state,
-                redirect: .init(scheme: "linkedbillingdemo", host: "oauth", path: "/callback"),
+                redirect: .init(scheme: "https", host: "app.example.com", path: "/claude/billing/callback"),
                 createdAt: clock.now())
             // A forged callback first: wrong state. It is rejected and does not burn the session.
             let forgedResult = session.handleCallback(forged, at: clock.now())

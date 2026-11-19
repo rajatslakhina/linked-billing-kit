@@ -21,13 +21,18 @@ public struct LinkPolicy: Hashable, Sendable {
     /// slow probe that is still running will be joined by a second one. (Package
     /// choice: 10 min, above a long non-streaming Messages call.)
     public var probeTimeoutMillis: Int64 { didSet { probeTimeoutMillis = max(1_000, probeTimeoutMillis) } }
+    /// A link flow that hasn't completed after this long is treated as abandoned. The
+    /// pushed authorization request expires after 10 minutes (docs), and nothing tells
+    /// your app when a user simply closes the sign-in sheet.
+    public var pendingTimeoutMillis: Int64 { didSet { pendingTimeoutMillis = min(max(1_000, pendingTimeoutMillis), 3_600_000) } }
 
     public init(
         warmupMillis: Int64 = 10_000,
         capProbeMillis: Int64 = 15 * 60_000,
         refusalProbeMillis: Int64 = 30 * 60_000,
         maxProbeMillis: Int64 = 6 * 3_600_000,
-        probeTimeoutMillis: Int64 = 10 * 60_000
+        probeTimeoutMillis: Int64 = 10 * 60_000,
+        pendingTimeoutMillis: Int64 = 10 * 60_000
     ) {
         // Clamp to sane, non-negative values so a bad config cannot produce a
         // probe schedule in the past or an interval that overflows when doubled.
@@ -36,6 +41,7 @@ public struct LinkPolicy: Hashable, Sendable {
         self.refusalProbeMillis = max(1_000, refusalProbeMillis)
         self.maxProbeMillis = max(self.capProbeMillis, self.refusalProbeMillis, maxProbeMillis)
         self.probeTimeoutMillis = max(1_000, probeTimeoutMillis)
+        self.pendingTimeoutMillis = min(max(1_000, pendingTimeoutMillis), 3_600_000)
     }
 }
 
@@ -125,7 +131,7 @@ public enum LinkEvent: Hashable, Sendable {
 /// 5. `connection_status` of `unknown` never changes state; `connected` never
 ///    overrides request-observed health; a `disconnected`/`not_connected` read issued
 ///    before a request that proved the connection alive (a success or a 402) doesn't
-///    unlink it.
+///    unlink it, whichever of the two arrives first.
 public struct LinkState: Sendable {
     public private(set) var phase: LinkPhase
     public let policy: LinkPolicy
@@ -139,6 +145,11 @@ public struct LinkState: Sendable {
     /// issued: a success, or a 402 (the API checks the connection before the cap and
     /// the org's billing).
     private var connectedEvidence = Ticket(sequence: 0)
+    /// Set when a status read (not a user action) ended the link: the read's ticket.
+    /// A request issued after that read which then proves the connection alive
+    /// restores the link, so the order in which a read and an outcome *arrive*
+    /// doesn't decide the result.
+    private var unlinkedByRead: Ticket?
     private var probe: (ticket: Ticket, startedAt: EpochMillis)?
     private var failedProbes: Int = 0
     private var everLinked: Bool
@@ -174,7 +185,11 @@ public struct LinkState: Sendable {
     public func admission(at now: EpochMillis) -> CustomerAdmission {
         switch phase {
         case .notLinked: return .deny(.notLinked)
-        case .linkPending: return .deny(.linkInProgress)
+        case let .linkPending(startedAt):
+            if now >= Saturating.add(startedAt, policy.pendingTimeoutMillis) {
+                return .deny(everLinked ? .unlinked(nil) : .notLinked) // abandoned
+            }
+            return .deny(.linkInProgress)
         case let .unlinked(reason, _): return .deny(.unlinked(reason))
         case let .linked(health):
             switch health {
@@ -217,12 +232,16 @@ public struct LinkState: Sendable {
     @discardableResult
     public mutating func apply(_ event: LinkEvent, at now: EpochMillis) -> Bool {
         let before = phase
+        if case let .linkPending(startedAt) = phase, now >= Saturating.add(startedAt, policy.pendingTimeoutMillis) {
+            phase = everLinked ? .unlinked(reason: nil, detectedAt: now) : .notLinked // abandoned flow
+        }
         switch event {
         case .linkStarted:
             if case .linked = phase { break } // re-approving an active link changes nothing
             phase = .linkPending(startedAt: now)
         case .linkCompleted:
             authoritative = issueTicket()
+            unlinkedByRead = nil
             everLinked = true
             clearProbe(resetFailures: true)
             phase = .linked(.warmingUp(until: Saturating.add(now, policy.warmupMillis)))
@@ -231,6 +250,7 @@ public struct LinkState: Sendable {
             phase = everLinked ? .unlinked(reason: nil, detectedAt: now) : .notLinked
         case .unlinkedByApp:
             authoritative = issueTicket()
+            unlinkedByRead = nil
             clearProbe(resetFailures: true)
             phase = .unlinked(reason: .revokedByAppOwner, detectedAt: now)
         case let .statusObserved(status, ticket):
@@ -261,6 +281,7 @@ public struct LinkState: Sendable {
                 return
             case .notLinked, .unlinked:
                 // Linked from elsewhere (another device or the web).
+                unlinkedByRead = nil
                 everLinked = true
                 clearProbe(resetFailures: true)
                 phase = .linked(.billable)
@@ -273,6 +294,7 @@ public struct LinkState: Sendable {
             case .unlinked:
                 return
             case .linked, .notLinked:
+                if case .linked = phase { unlinkedByRead = ticket }
                 everLinked = true
                 clearProbe(resetFailures: true)
                 phase = .unlinked(reason: reason, detectedAt: now)
@@ -283,13 +305,29 @@ public struct LinkState: Sendable {
             case .linkPending, .notLinked:
                 return
             case .linked, .unlinked:
+                if case .linked = phase { unlinkedByRead = ticket }
                 clearProbe(resetFailures: true)
                 phase = .notLinked
             }
         }
     }
 
+    /// A read unlinked us, but a request issued *after* that read has now proved the
+    /// connection alive (a success or a 402): the read was stale by the time it
+    /// landed. Put the link back so the outcome can be applied.
+    private mutating func restoreIfUnlinkedByOlderRead(_ ticket: Ticket) {
+        guard let read = unlinkedByRead, ticket > read, ticket > authoritative else { return }
+        switch phase {
+        case .unlinked, .notLinked:
+            unlinkedByRead = nil
+            phase = .linked(.billable)
+        case .linked, .linkPending:
+            return
+        }
+    }
+
     private mutating func applyRefusal(_ refusal: BillingRefusal, ticket: Ticket, sentAt: EpochMillis, now: EpochMillis) {
+        if refusal == .spendLimitReached || refusal == .billingUnavailable { restoreIfUnlinkedByOlderRead(ticket) }
         guard ticket > authoritative, case let .linked(health) = phase else { return }
         guard refusal.isCustomerBillingSignal else {
             // Overloaded / caller bugs say nothing about the customer. A probe that
@@ -337,6 +375,7 @@ public struct LinkState: Sendable {
     }
 
     private mutating func applySuccess(ticket: Ticket, now: EpochMillis) {
+        restoreIfUnlinkedByOlderRead(ticket)
         guard ticket > authoritative, case .linked = phase else { return }
         connectedEvidence = max(connectedEvidence, ticket) // the org paid: it was connected
         // Invariant 2: only a request issued after the newest applied outcome counts.
@@ -357,12 +396,15 @@ public struct LinkState: Sendable {
 
     /// base × 2^failedProbes, saturating, capped at `maxProbeMillis`.
     private func backoff(_ base: Int64) -> Int64 {
+        // The ceiling never drops below the first interval, whatever order the policy's
+        // fields were set in.
+        let ceiling = max(policy.maxProbeMillis, base)
         var interval = base
         var remaining = failedProbes
-        while remaining > 0, interval < policy.maxProbeMillis {
+        while remaining > 0, interval < ceiling {
             interval = Saturating.multiply(interval, 2)
             remaining -= 1
         }
-        return min(interval, policy.maxProbeMillis)
+        return min(interval, ceiling)
     }
 }

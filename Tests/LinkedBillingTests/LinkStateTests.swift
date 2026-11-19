@@ -287,6 +287,46 @@ final class LinkStateTests: XCTestCase {
         guard case .linked(.spendLimitReached) = state.phase else { return XCTFail("\(state.phase)") }
     }
 
+    func testANewerSuccessRestoresALinkThatAnOlderReadEnded() {
+        var state = billableLink()
+        let read = state.issueTicket()
+        let request = state.issueTicket()
+        // This time the stale read lands first…
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: read), at: t0)
+        guard case .unlinked = state.phase else { return XCTFail("\(state.phase)") }
+        // …and the newer request's success proves the connection was alive after it.
+        state.apply(.customerBilled(ticket: request), at: t0 + 1)
+        XCTAssertEqual(state.phase, .linked(.billable))
+    }
+
+    func testANewer402RestoresALinkThatAnOlderReadEndedThenApplies() {
+        var state = billableLink()
+        let read = state.issueTicket()
+        let request = state.issueTicket()
+        state.apply(.statusObserved(.notConnected, ticket: read), at: t0)
+        XCTAssertEqual(state.phase, .notLinked)
+        state.apply(.customerRefused(.spendLimitReached, ticket: request), at: t0 + 1)
+        guard case .linked(.spendLimitReached) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
+    func testAnOutcomeOlderThanTheReadDoesNotRestore() {
+        var state = billableLink()
+        let request = state.issueTicket()
+        let read = state.issueTicket()
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .revokedByAdmin), ticket: read), at: t0)
+        state.apply(.customerBilled(ticket: request), at: t0 + 1)
+        XCTAssertEqual(state.phase, .unlinked(reason: .revokedByAdmin, detectedAt: t0))
+    }
+
+    func testAnAbandonedLinkFlowExpires() {
+        var state = LinkState()
+        state.apply(.linkStarted, at: t0)
+        XCTAssertEqual(state.admission(at: t0 + 10 * 60_000 - 1), .deny(.linkInProgress))
+        XCTAssertEqual(state.admission(at: t0 + 10 * 60_000), .deny(.notLinked))
+        state.apply(.statusObserved(.unknown, ticket: state.issueTicket()), at: t0 + 10 * 60_000)
+        XCTAssertEqual(state.phase, .notLinked)
+    }
+
     func testNotConnectedAfterTheLinkMeansTheServerNeverSawIt() {
         var state = billableLink()
         state.apply(.statusObserved(.notConnected, ticket: state.issueTicket()), at: t0)
@@ -349,6 +389,15 @@ final class LinkStateTests: XCTestCase {
         limits.maxRetryWaitMillis = .max
         XCTAssertEqual(limits.maxAttempts, 1)
         XCTAssertEqual(limits.maxRetryWaitMillis, 3_600_000)
+    }
+
+    func testLoweringTheProbeCeilingAfterInitNeverProbesSoonerThanTheFirstInterval() {
+        var policy = LinkPolicy()
+        policy.maxProbeMillis = 1_000
+        var state = billableLink(policy: policy)
+        state.apply(.customerRefused(.spendLimitReached, ticket: state.issueTicket()), at: t0)
+        guard case let .linked(.spendLimitReached(_, next)) = state.phase else { return XCTFail("\(state.phase)") }
+        XCTAssertEqual(next, t0 + 15 * 60_000)
     }
 
     func testPolicyClampsHostileValues() {
