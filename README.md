@@ -99,7 +99,7 @@ stateDiagram-v2
 
 ## Design decisions and trade-offs
 
-- **Ordering by ticket, not by timestamp.** Every request, status read and link action (including a link start that leaves an active link in place, and the expiry of an abandoned flow) takes a `Ticket` from the same counter before it suspends. The expiry is folded in by `LinkState.settle(at:)` before any later ticket is issued, so a read that starts after a flow expired always counts. Wall-clock timestamps can tie, go backwards, or come from a different machine. The ticket makes "issued later" well defined, so a result that lands after an actor suspension can't undo newer evidence. *Trade-off:* ticket order is the client's issue order, not the server's processing order. See the limits below. *Rejected:* serialising all requests per customer, which is correct but turns one slow call into head-of-line blocking for the whole customer.
+- **Ordering by ticket, not by timestamp.** Every request, status read and link action (including the expiry of an abandoned flow) takes a `Ticket` from the same counter before it suspends. The one deliberate exception is a link start on a link that already reads as linked (a scope re-approval): it changes nothing and takes no ticket, so requests and reads in flight still count. The expiry is folded in by `LinkState.settle(at:)` before any later ticket is issued, so a read that starts after a flow expired always counts. Wall-clock timestamps can tie, go backwards, or come from a different machine. The ticket makes "issued later" well defined, so a result that lands after an actor suspension can't undo newer evidence. *Trade-off:* ticket order is the client's issue order, not the server's processing order. See the limits below. *Rejected:* serialising all requests per customer, which is correct but turns one slow call into head-of-line blocking for the whole customer.
 - **One actor owns all mutable state.** Routing, reservation and state transitions happen in one actor turn. The only suspension points are the transport call and retry sleeps. *Rejected:* separate actors for state and ledger, which reintroduces a check-then-act race between "can the customer pay?" and "reserve the subsidy".
 - **Reservations, not post-hoc accounting.** An app-paid decision reserves its estimate before sending, and settles to the actual cost after. *Trade-off:* a request whose transport fails releases its reservation and is recorded as "unknown", not spent. If the server actually served it, the ledger under-counts by its real cost.
 - **Probe, don't wait.** The cap is unreadable, so the design pays a small cost (one customer-billed request every 15 min to 6 h while capped) to avoid subsidising a customer who has already raised their cap. *Rejected:* waiting for the month boundary (expensive), and probing every request (it multiplies refused calls and log noise).
@@ -111,8 +111,8 @@ stateDiagram-v2
 
 ## Verification
 
-- **146 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
-- **84 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
+- **147 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
+- **86 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
 - **CI** ([Actions](../../actions)) runs a clean Linux build and tests on Swift 6.0 with warnings as errors, macOS tests plus a generic iOS Simulator build of both products, and the mutation check.
 - **The scripted month the demo plays is tested directly** (`ScriptedMonthTests`), so the numbers in the demo's screenshots are asserted, not hand-copied.
 
@@ -138,7 +138,7 @@ stateDiagram-v2
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.5.1")
+.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.6.0")
 ```
 
 ```swift

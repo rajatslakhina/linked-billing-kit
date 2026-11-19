@@ -468,28 +468,46 @@ final class LinkStateTests: XCTestCase {
         // The read was issued before the user re-approved a link that read as linked.
         // Landing first, it unlinks and the start begins a flow; landing after, the start
         // leaves the link in place and the read unlinks it. Both deny the customer, and
-        // completing or cancelling-then-reading gives one state.
-        let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
-        var completed: [LinkPhase] = []
-        var reconciled: [LinkPhase] = []
-        for readFirst in [true, false] {
-            var state = billableLink()
-            let read = state.issueTicket()
-            if readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
-            state.apply(.linkStarted, at: t0 + 1)
-            if !readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
-            guard case .deny = state.admission(at: t0 + 2) else {
-                return XCTFail("readFirst \(readFirst): customer still admitted: \(state.phase)")
+        // completing, or cancelling and then reading afresh, gives one state.
+        let cases: [(ConnectionStatus, LinkPhase)] = [
+            (.disconnected(revokedAt: nil, reason: .revokedByAdmin), .unlinked(reason: .revokedByAdmin, detectedAt: t0 + 5)),
+            (.notConnected, .notLinked),
+        ]
+        for (negative, settled) in cases {
+            var completed: [LinkPhase] = []
+            var reconciled: [LinkPhase] = []
+            for readFirst in [true, false] {
+                var state = billableLink()
+                let read = state.issueTicket()
+                if readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
+                state.apply(.linkStarted, at: t0 + 1)
+                if !readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
+                guard case .deny = state.admission(at: t0 + 2) else {
+                    return XCTFail("\(negative) readFirst \(readFirst): customer still admitted: \(state.phase)")
+                }
+                var done = state
+                done.apply(.linkCompleted, at: t0 + 3)
+                completed.append(done.phase)
+                state.apply(.linkCancelled, at: t0 + 3)
+                state.apply(.statusObserved(negative, ticket: state.issueTicket(at: t0 + 4)), at: t0 + 5)
+                reconciled.append(state.phase)
             }
-            var done = state
-            done.apply(.linkCompleted, at: t0 + 3)
-            completed.append(done.phase)
-            state.apply(.linkCancelled, at: t0 + 3)
-            state.apply(.statusObserved(negative, ticket: state.issueTicket(at: t0 + 4)), at: t0 + 5)
-            reconciled.append(state.phase)
+            XCTAssertEqual(completed, Array(repeating: .linked(.warmingUp(until: t0 + 3 + 10_000)), count: 2), "\(negative)")
+            XCTAssertEqual(reconciled, [settled, settled], "\(negative)")
         }
-        XCTAssertEqual(completed, Array(repeating: .linked(.warmingUp(until: t0 + 3 + 10_000)), count: 2))
-        XCTAssertEqual(reconciled, Array(repeating: .unlinked(reason: .revokedByAdmin, detectedAt: t0 + 5), count: 2))
+    }
+
+    func testAProbeRefusedInsideTheWarmUpFreesTheProbeSlot() {
+        // Allowed by the policy clamps: a 1 s cap probe falls inside the 10 s warm-up.
+        var state = LinkState(policy: LinkPolicy(capProbeMillis: 1_000))
+        state.apply(.linkStarted, at: t0)
+        state.apply(.linkCompleted, at: t0)
+        state.apply(.customerRefused(.spendLimitReached, ticket: state.issueTicket(), sentAt: t0 + 1_000), at: t0 + 1_000)
+        let probe = state.issueTicket()
+        XCTAssertTrue(state.beginProbe(ticket: probe, at: t0 + 2_000))
+        state.apply(.customerRefused(.notBillable, ticket: probe, sentAt: t0 + 2_000), at: t0 + 2_100)
+        XCTAssertFalse(state.probeInFlight)
+        XCTAssertEqual(state.admission(at: t0 + 2_100), .probe) // not blocked for probeTimeoutMillis
     }
 
     func testAReapprovalDoesNotMakeInFlightRequestOutcomesStale() {

@@ -228,8 +228,13 @@ public struct LinkState: Sendable {
         case let .pending(startedAt):
             return .linkPending(startedAt: startedAt)
         case let .abandoned(at):
-            if let read = negativeRead, case let .disconnected(_, reason) = read.status {
-                return .unlinked(reason: reason, detectedAt: read.at)
+            if let read = negativeRead {
+                switch read.status {
+                case let .disconnected(_, reason): return .unlinked(reason: reason, detectedAt: read.at)
+                // As on a linked base: the server has no connection, so nothing to relink.
+                case .notConnected: return .notLinked
+                case .connected, .unknown: break // never stored as a negative read
+                }
             }
             return everLinked ? .unlinked(reason: nil, detectedAt: at) : .notLinked
         case let .unlinked(reason, at):
@@ -454,7 +459,10 @@ public struct LinkState: Sendable {
             return
         }
         if refusal == .notBillable, isInWarmup(sentAt: sentAt) {
-            return // the docs' ~10 s propagation window: retry, don't degrade
+            // The docs' ~10 s propagation window: retry, don't degrade. A probe that hit
+            // it didn't answer the question, so it frees the slot.
+            if probe?.ticket == ticket { clearProbe(resetFailures: false) }
+            return
         }
         let wasProbe = probe?.ticket == ticket
         if wasProbe {
