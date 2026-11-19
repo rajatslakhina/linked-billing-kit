@@ -145,11 +145,13 @@ public struct LinkState: Sendable {
     /// issued: a success, or a 402 (the API checks the connection before the cap and
     /// the org's billing).
     private var connectedEvidence = Ticket(sequence: 0)
-    /// Set when a status read (not a user action) ended the link: the read's ticket.
-    /// A request issued after that read which then proves the connection alive
-    /// restores the link, so the order in which a read and an outcome *arrive*
-    /// doesn't decide the result.
-    private var unlinkedByRead: Ticket?
+    /// Set when a status read (not a user action) ended the link: the read's ticket and
+    /// the health the link had at that moment. A request issued after that read which
+    /// then proves the connection alive restores exactly that health, and its own
+    /// outcome then applies on top only if it is newer than the latest one. So neither
+    /// the order in which a read and an outcome *arrive*, nor a stale outcome, decides
+    /// the result.
+    private var unlinkedByRead: (ticket: Ticket, health: LinkedHealth)?
     private var probe: (ticket: Ticket, startedAt: EpochMillis)?
     private var failedProbes: Int = 0
     private var everLinked: Bool
@@ -294,7 +296,7 @@ public struct LinkState: Sendable {
             case .unlinked:
                 return
             case .linked, .notLinked:
-                if case .linked = phase { unlinkedByRead = ticket }
+                if case let .linked(health) = phase { unlinkedByRead = (ticket, health) }
                 everLinked = true
                 clearProbe(resetFailures: true)
                 phase = .unlinked(reason: reason, detectedAt: now)
@@ -305,7 +307,7 @@ public struct LinkState: Sendable {
             case .linkPending, .notLinked:
                 return
             case .linked, .unlinked:
-                if case .linked = phase { unlinkedByRead = ticket }
+                if case let .linked(health) = phase { unlinkedByRead = (ticket, health) }
                 clearProbe(resetFailures: true)
                 phase = .notLinked
             }
@@ -316,11 +318,11 @@ public struct LinkState: Sendable {
     /// connection alive (a success or a 402): the read was stale by the time it
     /// landed. Put the link back so the outcome can be applied.
     private mutating func restoreIfUnlinkedByOlderRead(_ ticket: Ticket) {
-        guard let read = unlinkedByRead, ticket > read, ticket > authoritative else { return }
+        guard let saved = unlinkedByRead, ticket > saved.ticket, ticket > authoritative else { return }
         switch phase {
         case .unlinked, .notLinked:
             unlinkedByRead = nil
-            phase = .linked(.billable)
+            phase = .linked(saved.health)
         case .linked, .linkPending:
             return
         }

@@ -309,6 +309,30 @@ final class LinkStateTests: XCTestCase {
         guard case .linked(.spendLimitReached) = state.phase else { return XCTFail("\(state.phase)") }
     }
 
+    func testAStaleOutcomeThatDisprovesAnOlderReadKeepsANewerNotBillable() {
+        // Read R, then requests A and B. Arrival: B (403), R (disconnected), A (success).
+        var state = billableLink()
+        let read = state.issueTicket()
+        let a = state.issueTicket()
+        let b = state.issueTicket()
+        state.apply(.customerRefused(.notBillable, ticket: b), at: t0)
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: read), at: t0 + 1)
+        state.apply(.customerBilled(ticket: a), at: t0 + 2)
+        guard case .linked(.notBillable) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
+    func testTheSameThreeResultsInAnotherOrderEndTheSame() {
+        // Arrival: B (403), A (success), R (disconnected).
+        var state = billableLink()
+        let read = state.issueTicket()
+        let a = state.issueTicket()
+        let b = state.issueTicket()
+        state.apply(.customerRefused(.notBillable, ticket: b), at: t0)
+        state.apply(.customerBilled(ticket: a), at: t0 + 1)
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: read), at: t0 + 2)
+        guard case .linked(.notBillable) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
     func testAnOutcomeOlderThanTheReadDoesNotRestore() {
         var state = billableLink()
         let request = state.issueTicket()

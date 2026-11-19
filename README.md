@@ -26,7 +26,7 @@ Sending that field is the easy part. This package handles what the docs warn you
 
 "Who pays for inference" is an architecture decision, not a pricing slide. Once it can change per request, every layer is affected: auth (an OAuth link the app starts and the back end completes), routing (a decision that depends on plan, link health and budgets), failure semantics (three new refusals, each needing a different response) and state (a link that can end without any notification). Teams that treat it as a header flag find that out one support ticket at a time.
 
-The design uses a pure decision core, one actor that owns all mutable state, and explicit ordering for results that arrive late. Every concurrency and money claim below is pinned by a test, and each of those tests is checked against a deliberately broken implementation (72 mutants, run in CI).
+The design uses a pure decision core, one actor that owns all mutable state, and explicit ordering for results that arrive late. Every concurrency and money claim below is pinned by a test, and each of those tests is checked against a deliberately broken implementation (73 mutants, run in CI).
 
 ## How it fits together
 
@@ -111,8 +111,8 @@ stateDiagram-v2
 
 ## Verification
 
-- **125 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
-- **72 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
+- **127 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
+- **73 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
 - **CI** ([Actions](../../actions)) runs a clean Linux build and tests on Swift 6.0 with warnings as errors, macOS tests plus a generic iOS Simulator build of both products, and the mutation check.
 - **The scripted month the demo plays is tested directly** (`ScriptedMonthTests`), so the numbers in the demo's screenshots are asserted, not hand-copied.
 
@@ -136,7 +136,7 @@ stateDiagram-v2
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.2.0")
+.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.2.1")
 ```
 
 ```swift

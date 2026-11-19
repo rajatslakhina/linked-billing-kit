@@ -53,7 +53,7 @@ public struct RetryLimits: Hashable, Sendable {
     /// Backoff after a 503 without a usable `retry-after`: base × 2^retry.
     public var overloadBackoffMillis: Int64 { didSet { overloadBackoffMillis = min(max(0, overloadBackoffMillis), 60_000) } }
     /// The longest single wait a `send` will sit through for a 503. A `retry-after`
-    /// beyond it (the API may ask for up to an hour) fails the request as
+    /// beyond it (this package clamps `retry-after` to an hour) fails the request as
     /// `.overloaded` instead of holding the caller.
     public var maxRetryWaitMillis: Int64 { didSet { maxRetryWaitMillis = min(max(0, maxRetryWaitMillis), 3_600_000) } }
     /// Delay before re-sending a `not_billable` refused inside the warm-up window.
