@@ -39,11 +39,11 @@ final class ConnectionReconcilerTests: XCTestCase {
         await waitUntil { await source.waitingCount == 1 }
         let b = Task { await reconciler.reconcileNow() }
         let c = Task { await reconciler.reconcileNow() }
-        for _ in 0..<50 { await Task.yield() }
+        await settle()
         await source.release(.connected)
         // If single-flight were broken, a late duplicate read could still be waiting;
         // release again so the test fails on its assertions instead of hanging.
-        for _ in 0..<50 { await Task.yield() }
+        await settle()
         await source.release(.connected)
         let results = [await a.value, await b.value, await c.value]
         let reads = await source.reads
@@ -58,7 +58,7 @@ final class ConnectionReconcilerTests: XCTestCase {
         let older = Task { await reconciler.reconcileNow() }
         await waitUntil { await source.waitingCount == 1 }
         let fresh = Task { await reconciler.reconcileNow(fresh: true) }
-        for _ in 0..<50 { await Task.yield() }
+        await settle()
         await source.release(.notConnected)             // the older read lands
         await waitUntil { await source.waitingCount == 1 } // the fresh one starts its own read
         await source.release(.connected)
@@ -241,6 +241,13 @@ final class LinkSessionTests: XCTestCase {
         XCTAssertEqual(session.handleCallback(try callback("code=a&state=\(state)"), at: 2_000), .rejected(.alreadyUsed))
         let early = try self.session(at: 5_000)
         XCTAssertEqual(early.handleCallback(try callback("code=a&state=\(state)"), at: 4_999), .rejected(.expired))
+    }
+
+    func testAForgedCallbackDuringClockSkewDoesNotBurnTheSession() throws {
+        let session = try session(at: 5_000)
+        // The device clock reads earlier than the session's creation time.
+        XCTAssertEqual(session.handleCallback(try callback("code=evil&state=s_wrong"), at: 4_000), .rejected(.stateMismatch))
+        XCTAssertEqual(session.handleCallback(try callback("code=good&state=\(state)"), at: 6_000), .code("good"))
     }
 
     func testCancelAndRedirectMismatchAreReported() throws {

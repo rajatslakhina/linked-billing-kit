@@ -35,19 +35,27 @@ public struct BillingEnvelope: Hashable, Sendable {
     /// Merge into the request body as `"billing_policy"`.
     public let billingPolicy: [String: String]
 
-    /// - Parameter additionalBetas: other betas the same request needs (for example
-    ///   for a tool). They're joined into the single `anthropic-beta` header, so the
-    ///   billing beta and yours don't overwrite each other.
-    public init(payer: Payer, betaHeaderValue: String = BillingEnvelope.billingBeta,
+    /// - Parameters:
+    ///   - profile: the customer's user profile, if there is one. Sent as
+    ///     `anthropic-user-profile-id` on every call for a linked customer, including
+    ///     app-paid ones, so the Console and usage API attribute that usage to them.
+    ///   - additionalBetas: other betas the same request needs (for example for a
+    ///     tool). They're joined into the single `anthropic-beta` header, so the
+    ///     billing beta and yours don't overwrite each other.
+    public init(payer: Payer, profile: UserProfileID? = nil,
+                betaHeaderValue: String = BillingEnvelope.billingBeta,
                 additionalBetas: [String] = []) {
         var betas = [betaHeaderValue]
         for beta in additionalBetas where !betas.contains(beta) { betas.append(beta) }
         var headers = ["anthropic-beta": betas.joined(separator: ",")]
-        if case let .customer(profile) = payer {
+        switch payer {
+        case let .customer(billed):
             // Required when bill_to is user_profile and the call authenticates as
             // the operator service account; without it the API answers
-            // 400 user_profile_required.
-            headers["anthropic-user-profile-id"] = profile.rawValue
+            // 400 user_profile_required. The billed profile always wins.
+            headers["anthropic-user-profile-id"] = billed.rawValue
+        case .app:
+            if let profile { headers["anthropic-user-profile-id"] = profile.rawValue }
         }
         self.headers = headers
         self.billingPolicy = ["type": "billing_policy", "bill_to": payer.wireValue]

@@ -66,6 +66,7 @@ public final class AdvancingSleeper: BillingSleeper, @unchecked Sendable {
 public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
     public struct Received: Hashable, Sendable {
         public let payer: Payer
+        public let profile: UserProfileID?
         public let model: ModelID
         public let featureID: String
     }
@@ -92,8 +93,11 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
     public var appRefusal: BillingRefusal?
     /// The next N status reads throw.
     public var failStatusReads = 0
-    /// Delay each `send` by this much real time (to widen reentrancy windows in tests).
+    /// Delay each `send` by this much real time, so concurrent sends overlap.
     public var sendLatencyNanos: UInt64 = 0
+    private var inFlight = 0
+    /// The most sends that were inside `send` at the same moment.
+    public private(set) var maxConcurrentSends = 0
 
     public private(set) var received: [Received] = []
 
@@ -107,6 +111,11 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
         connectedAt = clock.now()
     }
 
+    /// Start measuring `maxConcurrentSends` afresh.
+    public func resetConcurrencyGauge() {
+        maxConcurrentSends = inFlight
+    }
+
     public func unlink(reason: ConnectionStatus.RevocationReason) {
         connected = false
         revocationReason = reason
@@ -118,9 +127,13 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
 
     // MARK: MessagesTransport
 
-    public func send(_ request: InferenceRequest, payer: Payer, model: ModelID) async throws -> TransportResult {
+    public func send(_ request: InferenceRequest, payer: Payer, profile: UserProfileID?,
+                     model: ModelID) async throws -> TransportResult {
+        inFlight += 1
+        maxConcurrentSends = max(maxConcurrentSends, inFlight)
+        defer { inFlight -= 1 }
         if sendLatencyNanos > 0 { try await Task.sleep(nanoseconds: sendLatencyNanos) }
-        received.append(Received(payer: payer, model: model, featureID: request.feature.id))
+        received.append(Received(payer: payer, profile: profile, model: model, featureID: request.feature.id))
         let cost = model == request.feature.model
             ? request.estimate
             : BillingRouter.subsidyChoice(feature: request.feature, estimate: request.estimate).1

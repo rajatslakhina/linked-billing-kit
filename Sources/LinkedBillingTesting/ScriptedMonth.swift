@@ -116,7 +116,8 @@ public actor ScriptedMonth {
         case orgChange(@Sendable (isolated SimulatedClaudeOrg) -> Void)
         case consoleUnlink
         case request(Role, cents: Int64, times: Int)
-        /// Fired concurrently: every request reserves before any completes.
+        /// Fired concurrently, with each simulated reply held for 50 ms so the sends
+        /// really overlap; the step's note reports how many were in flight at once.
         case concurrentBurst(Role, cents: Int64, count: Int)
         case reconcileIfRecommended
     }
@@ -158,7 +159,7 @@ public actor ScriptedMonth {
              actions: [.advance(minutes: 45), .consoleUnlink, .advance(minutes: 5),
                        .request(.summarize, cents: 40, times: 1), .reconcileIfRecommended]),
         Step(title: "Concurrent burst meets the subsidy budget",
-             narrative: "Five requests fire at once against a $3 monthly subsidy. Each reserves its cost before any reply comes back, so three fit and two pause with a reason, instead of all five seeing the same remaining budget.",
+             narrative: "Five requests fire at once against a $3 monthly subsidy. Each reserves its cost before it is sent, so even with all of them in flight together only three fit; two pause with a reason instead of all five seeing the same remaining budget.",
              actions: [.advance(minutes: 30), .concurrentBurst(.summarize, cents: 300, count: 5)]),
         Step(title: "00:00 UTC, 1 December",
              narrative: "Budgets roll over on the UTC month boundary, not the device's time zone. The allowance covers usage again, and relinking would restore customer billing.",
@@ -211,12 +212,18 @@ public actor ScriptedMonth {
                 let request = InferenceRequest(feature: feature, estimate: MicroUSD(Saturating.multiply(cents, 10_000)),
                                                prompt: "demo")
                 let gateway = self.gateway
+                await org.configure { $0.sendLatencyNanos = 50_000_000 }
+                await org.resetConcurrencyGauge()
                 let results = await withTaskGroup(of: GatewayResult.self) { group in
                     for _ in 0..<max(0, count) { group.addTask { await gateway.send(request) } }
                     var collected: [GatewayResult] = []
                     for await result in group { collected.append(result) }
                     return collected
                 }
+                let peak = await org.maxConcurrentSends
+                await org.configure { $0.sendLatencyNanos = 0 }
+                let served = results.filter(Self.isServed).count
+                note = "\(peak) of the \(served) sent requests were in flight at the same moment; their reservations kept the other \(results.count - served) from being sent."
                 // Served first, then paused, so the card reads in a stable order.
                 for result in results.sorted(by: { Self.isServed($0) && !Self.isServed($1) }) {
                     requestCounter += 1

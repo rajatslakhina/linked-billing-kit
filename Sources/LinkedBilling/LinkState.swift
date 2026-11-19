@@ -98,8 +98,10 @@ public enum LinkEvent: Hashable, Sendable {
     case unlinkedByApp
     /// A `connection_status` read that was issued `ticket`.
     case statusObserved(ConnectionStatus, ticket: Ticket)
-    /// A customer-billed request issued `ticket` was refused.
-    case customerRefused(BillingRefusal, ticket: Ticket)
+    /// A customer-billed request issued `ticket` was refused. `sentAt` is when it was
+    /// sent: the ~10 s warm-up window is judged by send time, not by when a slow
+    /// response happened to arrive. (Defaults to the time the event is applied.)
+    case customerRefused(BillingRefusal, ticket: Ticket, sentAt: EpochMillis? = nil)
     /// A customer-billed request issued `ticket` succeeded.
     case customerBilled(ticket: Ticket)
     /// A customer-billed probe ended without an answer (transport error, cancelled).
@@ -225,8 +227,8 @@ public struct LinkState: Sendable {
         case let .statusObserved(status, ticket):
             guard ticket > authoritative else { break } // read began before a link/unlink
             applyStatus(status, ticket: ticket, now: now)
-        case let .customerRefused(refusal, ticket):
-            applyRefusal(refusal, ticket: ticket, now: now)
+        case let .customerRefused(refusal, ticket, sentAt):
+            applyRefusal(refusal, ticket: ticket, sentAt: sentAt ?? now, now: now)
         case let .customerBilled(ticket):
             applySuccess(ticket: ticket, now: now)
         case let .probeAbandoned(ticket):
@@ -278,7 +280,7 @@ public struct LinkState: Sendable {
         }
     }
 
-    private mutating func applyRefusal(_ refusal: BillingRefusal, ticket: Ticket, now: EpochMillis) {
+    private mutating func applyRefusal(_ refusal: BillingRefusal, ticket: Ticket, sentAt: EpochMillis, now: EpochMillis) {
         guard ticket > authoritative, case let .linked(health) = phase else { return }
         guard refusal.isCustomerBillingSignal else {
             // Overloaded / caller bugs say nothing about the customer. A probe that
@@ -292,7 +294,7 @@ public struct LinkState: Sendable {
             return
         }
 
-        if case let .warmingUp(until) = health, refusal == .notBillable, now < until {
+        if case let .warmingUp(until) = health, refusal == .notBillable, sentAt < until {
             return // the docs' ~10 s propagation window: retry, don't degrade
         }
         let wasProbe = probe?.ticket == ticket

@@ -284,6 +284,14 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.phase, .linked(.notBillable(nextProbeAt: t0 + 10_000 + 30 * 60_000)))
     }
 
+    func testTheWarmUpWindowIsJudgedBySendTimeNotArrivalTime() {
+        var state = LinkState()
+        state.apply(.linkCompleted, at: t0)
+        // Sent at 9.5 s, refused at 10.5 s: still inside the window that matters.
+        state.apply(.customerRefused(.notBillable, ticket: state.issueTicket(), sentAt: t0 + 9_500), at: t0 + 10_500)
+        XCTAssertEqual(state.phase, .linked(.warmingUp(until: t0 + 10_000)))
+    }
+
     func testOtherRefusalsDegradeEvenDuringWarmUp() {
         var state = LinkState()
         state.apply(.linkCompleted, at: t0)

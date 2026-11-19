@@ -12,7 +12,7 @@ actor ControlledTransport: MessagesTransport {
     private var pending: [(call: Call, continuation: CheckedContinuation<TransportResult, Error>)] = []
     private(set) var calls: [Call] = []
 
-    func send(_ request: InferenceRequest, payer: Payer, model: ModelID) async throws -> TransportResult {
+    func send(_ request: InferenceRequest, payer: Payer, profile: UserProfileID?, model: ModelID) async throws -> TransportResult {
         try await withCheckedThrowingContinuation { continuation in
             let call = Call(payer: payer, model: model)
             calls.append(call)
@@ -59,19 +59,26 @@ func expectResolved(_ transport: ControlledTransport, customer: Bool, with resul
 /// the test can't hang on a continuation nobody will resume.
 func waitForPending(_ transport: ControlledTransport, _ count: Int,
                     file: StaticString = #filePath, line: UInt = #line) async {
-    for _ in 0..<2_000 {
+    // Poll on wall-clock time, not a yield count: how many yields a task needs before
+    // it is scheduled varies by platform and load (Linux CI needs far more).
+    for _ in 0..<5_000 {
         if await transport.pendingCount == count { return }
-        await Task.yield()
+        try? await Task.sleep(nanoseconds: 1_000_000)
     }
     let actual = await transport.pendingCount
     XCTFail("expected \(count) pending calls, found \(actual)", file: file, line: line)
     await transport.drain()
 }
 
+/// Give concurrently started tasks time to reach their next suspension point.
+func settle() async {
+    try? await Task.sleep(nanoseconds: 100_000_000)
+}
+
 func waitUntil(_ condition: @Sendable () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
-    for _ in 0..<2_000 {
+    for _ in 0..<5_000 { // up to ~5 s, polled every millisecond
         if await condition() { return }
-        await Task.yield()
+        try? await Task.sleep(nanoseconds: 1_000_000)
     }
     XCTFail("condition never became true", file: file, line: line)
 }
@@ -110,6 +117,18 @@ final class GatewayTests: XCTestCase {
     }
 
     // MARK: Happy path and fallbacks
+
+    func testAppPaidRequestsStillCarryTheCustomersProfile() async throws {
+        let clock = ManualClock(start)
+        let org = SimulatedClaudeOrg(clock: clock)
+        await org.link()
+        await org.configure { $0.spendCap = .zero }
+        let (gateway, _, _, _) = make(clock: clock, org: org)
+        _ = await gateway.send(request())
+        let received = await org.received
+        XCTAssertEqual(received.map(\.payer.isCustomer), [true, false])
+        XCTAssertEqual(received.map(\.profile), [profile, profile])
+    }
 
     func testAHealthyLinkBillsTheCustomer() async throws {
         let clock = ManualClock(start)
@@ -153,6 +172,22 @@ final class GatewayTests: XCTestCase {
         guard case .served(_, .customer(profile), _, _) = result.outcome else { return XCTFail("\(result.outcome)") }
         XCTAssertEqual(sleeper.requestedWaits, [2_000])
         XCTAssertEqual(result.attempts.count, 2)
+    }
+
+    func testASlowRefusalSentInsideTheWarmUpWindowIsStillRetried() async throws {
+        let clock = ManualClock(start)
+        // Sent at 9.5 s after the link; the 403 arrives at 10.5 s.
+        let transport = SlowTransport(clock: clock, latencyMillis: 1_000,
+                                      script: [.refused(.notBillable, partialReply: nil),
+                                               .success(cost: MicroUSD(1), text: "ok")])
+        var fresh = LinkState()
+        fresh.apply(.linkCompleted, at: start - 9_500)
+        let (gateway, _, _, _) = make(clock: clock, link: fresh, transport: transport)
+        let result = await gateway.send(request())
+        let profile = try XCTUnwrap(self.profile)
+        guard case .served(_, .customer(profile), _, _) = result.outcome else {
+            return XCTFail("judged by arrival time, the link degraded: \(result.outcome)")
+        }
     }
 
     func testASecondWarmUpRefusalStopsTryingTheCustomerForThatRequest() async {
@@ -363,7 +398,7 @@ final class GatewayTests: XCTestCase {
         await waitForPending(transport, 1)
         // The first request is in flight: nothing spent yet, but its reservation is held.
         let second = Task { [req = request()] in await gateway.send(req) }
-        for _ in 0..<500 { await Task.yield() }
+        await settle()
         let inFlight = await transport.pendingCount
         XCTAssertEqual(inFlight, 1, "the second request must pause, not reach the transport")
         await expectResolved(transport, customer: false, with: .success(cost: MicroUSD(100_000), text: "ok"))
@@ -414,8 +449,28 @@ actor ScriptedTransport: MessagesTransport {
 
     init(_ script: [TransportResult]) { self.script = script }
 
-    func send(_ request: InferenceRequest, payer: Payer, model: ModelID) async throws -> TransportResult {
+    func send(_ request: InferenceRequest, payer: Payer, profile: UserProfileID?, model: ModelID) async throws -> TransportResult {
         callCount += 1
+        guard !script.isEmpty else { throw Exhausted() }
+        return script.removeFirst()
+    }
+}
+
+/// Returns scripted results, advancing a manual clock by `latencyMillis` per call.
+actor SlowTransport: MessagesTransport {
+    private let clock: ManualClock
+    private let latencyMillis: Int64
+    private var script: [TransportResult]
+    struct Exhausted: Error {}
+
+    init(clock: ManualClock, latencyMillis: Int64, script: [TransportResult]) {
+        self.clock = clock
+        self.latencyMillis = latencyMillis
+        self.script = script
+    }
+
+    func send(_ request: InferenceRequest, payer: Payer, profile: UserProfileID?, model: ModelID) async throws -> TransportResult {
+        clock.advance(by: latencyMillis)
         guard !script.isEmpty else { throw Exhausted() }
         return script.removeFirst()
     }

@@ -24,8 +24,13 @@ public enum TransportResult: Hashable, Sendable {
 /// Sends one `/v1/messages` call with the given payer. In production this lives in
 /// your back end and authenticates as the OAuth app's operator service account; the
 /// iOS app never holds that credential. Throwing means "sent, outcome unknown".
+///
+/// `profile` is the customer's user profile whenever one exists, *whoever pays*:
+/// the docs ask for the `anthropic-user-profile-id` header on every call for a linked
+/// customer, which is what attributes app-paid usage to that customer in the Console
+/// and the usage API. `BillingEnvelope(payer:profile:)` builds the headers.
 public protocol MessagesTransport: Sendable {
-    func send(_ request: InferenceRequest, payer: Payer, model: ModelID) async throws -> TransportResult
+    func send(_ request: InferenceRequest, payer: Payer, profile: UserProfileID?, model: ModelID) async throws -> TransportResult
 }
 
 /// Wall-clock time source (UTC epoch millis). Injected so tests can drive time.
@@ -192,7 +197,7 @@ public actor LinkedBillingGateway {
                 let payer = Payer.customer(profile)
                 let result: TransportResult
                 do {
-                    result = try await transport.send(request, payer: payer, model: model)
+                    result = try await transport.send(request, payer: payer, profile: profile, model: model)
                 } catch {
                     if isProbe { link.apply(.probeAbandoned(ticket: ticket), at: clock.now()) }
                     ledger.record(featureID: request.feature.id, payer: payer, budget: nil, model: model,
@@ -210,7 +215,7 @@ public actor LinkedBillingGateway {
                     return finish(.served(text: text, payer: payer, model: model, cost: cost))
 
                 case let .refused(refusal, partial):
-                    link.apply(.customerRefused(refusal, ticket: ticket), at: after)
+                    link.apply(.customerRefused(refusal, ticket: ticket, sentAt: now), at: after)
                     ledger.record(featureID: request.feature.id, payer: payer, budget: nil, model: model,
                                   outcome: .refused(refusal), reservation: nil, at: after)
                     attempts.append(GatewayAttempt(decision: decision,
@@ -251,7 +256,7 @@ public actor LinkedBillingGateway {
                 }
                 let result: TransportResult
                 do {
-                    result = try await transport.send(request, payer: .app, model: model)
+                    result = try await transport.send(request, payer: .app, profile: profile, model: model)
                 } catch {
                     ledger.record(featureID: request.feature.id, payer: .app, budget: budget, model: model,
                                   outcome: .unknown, reservation: reservation, at: clock.now())

@@ -119,16 +119,20 @@ final class WireProtocolTests: XCTestCase {
                        .disconnected(revokedAt: nil, reason: .other))
     }
 
-    func testEnvelopeSendsTheProfileHeaderOnlyWhenTheCustomerPays() throws {
+    func testEnvelopeAttributesEveryCallForALinkedCustomer() throws {
         let profile = try XCTUnwrap(UserProfileID("uprof_01HV9Z"))
         let customer = BillingEnvelope(payer: .customer(profile), betaHeaderValue: "beta-x")
         XCTAssertEqual(customer.headers["anthropic-user-profile-id"], "uprof_01HV9Z")
         XCTAssertEqual(customer.headers["anthropic-beta"], "beta-x")
         XCTAssertEqual(customer.billingPolicy, ["type": "billing_policy", "bill_to": "user_profile"])
 
-        let app = BillingEnvelope(payer: .app, betaHeaderValue: "beta-x")
-        XCTAssertNil(app.headers["anthropic-user-profile-id"])
+        // App-paid, but for a linked customer: still attributed to their profile.
+        let app = BillingEnvelope(payer: .app, profile: profile, betaHeaderValue: "beta-x")
+        XCTAssertEqual(app.headers["anthropic-user-profile-id"], "uprof_01HV9Z")
         XCTAssertEqual(app.billingPolicy["bill_to"], "self")
+        // No customer at all (e.g. the app's own evals): no profile header.
+        let own = BillingEnvelope(payer: .app)
+        XCTAssertNil(own.headers["anthropic-user-profile-id"])
     }
 
     func testOtherBetasAreMergedNotOverwritten() {

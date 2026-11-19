@@ -1,6 +1,8 @@
 # LinkedBilling
 
-**Let your B2B customers' Claude organizations pay for your iOS app's AI features, and turn every billing refusal into either a fallback or a pause your UI can explain.**
+**Let your B2B customers' Claude organizations pay for your iOS app's AI features, and turn every linked-billing refusal into either a fallback or a pause your UI can explain.**
+
+(The refusals are 402 `spend_limit_reached`, 402 `billing_unavailable` and 403 `not_billable`. Caller bugs and 503s that are still failing after their retries fail loudly instead of being hidden.)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/rajatslakhina/linked-billing-kit-demo-app/main/Demo/Screenshots/01-cap-reached.png" width="250" alt="Demo: three requests billed to the customer org, then 402 spend_limit_reached and a subsidised fallback in the same call">
@@ -15,7 +17,7 @@ Sending that field is the easy part. This package handles what the docs warn you
 |---|---|---|
 | A customer unlinked you in the Console. **There is no webhook and no email.** | Every request for that customer fails with 403 until someone notices. | `ConnectionReconciler` reads `connection_status` (single-flight) and gives you a phase-aware, jittered delay to poll on. After a `not_billable`, `GatewayResult.statusCheckRecommended` tells you to call `reconcileNow(fresh: true)`. |
 | How much of their spend cap is left. **You can't read the cap at all.** | You hit 402 mid-session. Or, after the first 402, you stop billing them until the 1st and quietly pay for a month. | A probe: after `spend_limit_reached`, exactly one request tests the customer again after 15 min (doubling on each failure), and never later than 00:00 UTC on the 1st. |
-| Who actually paid. **A successful response doesn't say.** | Your usage screen and your own subsidy budget are guesses. | A `SpendLedger` records every decision and outcome. Budgets count in-flight reservations, so a burst can't overshoot them. |
+| Who actually paid. **A successful response doesn't say.** | Your usage screen and your own subsidy budget are guesses. | A `SpendLedger` records every decision and outcome. Budgets count in-flight reservations, so a burst can't overshoot them on its estimates. A reply that costs more than its estimate still can (see Honest limits). |
 | Whether a new link works yet. **It can take ~10 s.** | The first request after "Link" fails and the customer's state flips to "broken". | A warm-up window: a `not_billable` inside it is retried once instead of degrading the link. |
 | Whether code execution can be billed to the customer. **It can't (400).** | A feature that works for you breaks for every linked customer. | The router never bills the customer for a code-execution feature. |
 | Whether an App Store subscriber is also paying through their org. | You charge the same usage twice. | Usage covered by the App Store subscription is always app-paid first. The linked org pays only beyond that allowance. |
@@ -24,7 +26,7 @@ Sending that field is the easy part. This package handles what the docs warn you
 
 "Who pays for inference" is an architecture decision, not a pricing slide. Once it can change per request, every layer is affected: auth (an OAuth link the app starts and the back end completes), routing (a decision that depends on plan, link health and budgets), failure semantics (three new refusals, each needing a different response) and state (a link that can end without any notification). Teams that treat it as a header flag find that out one support ticket at a time.
 
-The design uses a pure decision core, one actor that owns all mutable state, and explicit ordering for results that arrive late. Every concurrency and money claim below is pinned by a test, and each of those tests is checked against a deliberately broken implementation (55 mutants, run in CI).
+The design uses a pure decision core, one actor that owns all mutable state, and explicit ordering for results that arrive late. Every concurrency and money claim below is pinned by a test, and each of those tests is checked against a deliberately broken implementation (59 mutants, run in CI).
 
 ## How it fits together
 
@@ -67,10 +69,14 @@ stateDiagram-v2
     [*] --> NotLinked
     NotLinked --> LinkPending: linkStarted
     LinkPending --> WarmingUp: linkCompleted
-    LinkPending --> NotLinked: cancelled
+    LinkPending --> NotLinked: cancelled (first link)
+    LinkPending --> Unlinked: cancelled (was linked before)
+    Unlinked --> LinkPending: linkStarted (relink)
+    Billable --> NotLinked: status read says not_connected
     WarmingUp --> Billable: first success
     WarmingUp --> NotBillable: 403 not_billable after 10 s
-    WarmingUp --> SpendLimit: 402 (any time)
+    WarmingUp --> SpendLimit: 402 spend_limit_reached
+    WarmingUp --> Unavailable: 402 billing_unavailable
     Billable --> SpendLimit: 402 spend_limit_reached
     Billable --> Unavailable: 402 billing_unavailable
     Billable --> NotBillable: 403 not_billable (after warm-up)
@@ -105,8 +111,8 @@ stateDiagram-v2
 
 ## Verification
 
-- **109 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
-- **55 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant fails at least one test on an assertion.
+- **113 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
+- **59 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
 - **CI** ([Actions](../../actions)) runs a clean Linux build and tests on Swift 6.0 with warnings as errors, macOS tests plus a generic iOS Simulator build of both products, and the mutation check.
 - **The scripted month the demo plays is tested directly** (`ScriptedMonthTests`), so the numbers in the demo's screenshots are asserted, not hand-copied.
 
@@ -115,7 +121,7 @@ stateDiagram-v2
 - **The API is a beta,** and this package models it as documented in November 2026. `BillingEnvelope.billingBeta` is the documented beta value; pass a newer one when it changes. `/v1/chat/completions` (which returns the same statuses without the error code) isn't decoded here.
 - **The simulator is not the API.** `SimulatedClaudeOrg` follows the documented checks closely enough to exercise every branch. It is not a substitute for testing with a second organization on your app's *Test users* list.
 - **One gateway per customer, in memory.** A restart loses month-to-date totals, so the included and subsidy budgets start again from zero. A multi-instance back end needs the `LinkState` and ledger in shared storage with the same ticket discipline (for example a per-profile row with a version column). That's the next step, not something this package claims.
-- **Client order, not server order.** For two customer requests in flight together, the server may process them in the opposite order to their tickets. A late success can then briefly mark a capped link billable, which costs one extra refused (and unbilled) request before the state corrects itself.
+- **Client order, not server order.** For two customer requests in flight together, the server may process them in the opposite order to their tickets. A late success can then briefly mark a capped link billable. That costs one refused (unbilled) request for each request sent in that window, and resets the probe backoff, before the state corrects itself.
 - **Batches and streaming aren't modelled.** Message Batches can't bill a customer (the docs say such requests are refused), and the router doesn't know about batches: send them as app-paid. A `billing_unavailable` that arrives mid-stream comes as an error event after a 200, and your transport has to map it to `.refused(.billingUnavailable, partialReply:)`.
 - **Only 503 is retried.** 429 and 529 decode to `.other` and fail as `.rejected` without a retry. Put your general rate-limit retry policy in the transport.
 - **A link found by a status read skips the warm-up.** If `connection_status` reports `connected` for a customer the gateway thought was unlinked (they linked elsewhere), the first `not_billable` inside ~10 s degrades the link instead of being retried.
@@ -127,7 +133,7 @@ stateDiagram-v2
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "1.0.2")
+.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.0.0")
 ```
 
 ```swift
@@ -160,7 +166,7 @@ Task {
 }
 ```
 
-`AnthropicTransport`, `ProfileStatusSource`, `SystemClock` and `TaskSleeper` are yours to write: one `/v1/messages` call using `BillingEnvelope(payer:)` for the headers and body field (decode refusals with `BillingRefusal.decode`), one user-profile read decoded with `ConnectionStatus.decode`, `Date()` in milliseconds, and `Task.sleep`.
+`AnthropicTransport`, `ProfileStatusSource`, `SystemClock` and `TaskSleeper` are yours to write: one `/v1/messages` call using `BillingEnvelope(payer:profile:)` for the headers and body field (pass the profile even when the app pays: the docs ask for the profile header on every call for a linked customer, and it is what attributes app-paid usage to them in the Console) (decode refusals with `BillingRefusal.decode`), one user-profile read decoded with `ConnectionStatus.decode`, `Date()` in milliseconds, and `Task.sleep`.
 
 ## Demo app
 

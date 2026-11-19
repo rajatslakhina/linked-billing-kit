@@ -82,10 +82,11 @@ public final class LinkSession: @unchecked Sendable {
 
     /// Validate the callback.
     ///
-    /// The session is consumed by any callback that carries the right `state`
-    /// (a code, a denial, or a malformed answer) and by expiry. A redirect or `state`
-    /// mismatch does not consume it: an unrelated or forged URL must not be able to
-    /// cancel the user's real sign-in, and a 128-bit `state` can't be guessed by retrying.
+    /// The session is consumed only by a callback that carries the right `state`
+    /// (a code, a denial, a malformed answer, or one outside the TTL). A redirect
+    /// mismatch, a `state` mismatch or a duplicate parameter does not consume it: an
+    /// unrelated or forged URL must not be able to cancel the user's real sign-in, and
+    /// a 128-bit `state` can't be guessed by retrying.
     public func handleCallback(_ url: URL, at now: EpochMillis) -> CallbackResult {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == redirect.scheme,
@@ -94,10 +95,6 @@ public final class LinkSession: @unchecked Sendable {
 
         lock.lock(); defer { lock.unlock() }
         guard !consumed else { return .rejected(.alreadyUsed) }
-        guard now >= createdAt, now <= Saturating.add(createdAt, ttlMillis) else {
-            consumed = true
-            return .rejected(.expired)
-        }
 
         let items = components.queryItems ?? []
         // Duplicate parameters are a classic parser-confusion trick: two parsers can
@@ -108,7 +105,9 @@ public final class LinkSession: @unchecked Sendable {
         }
         guard let received = items.first(where: { $0.name == "state" })?.value,
               Self.constantTimeEquals(received, state) else { return .rejected(.stateMismatch) }
+        // From here on the callback is provably ours, so every outcome consumes it.
         consumed = true
+        guard now >= createdAt, now <= Saturating.add(createdAt, ttlMillis) else { return .rejected(.expired) }
 
         if let error = items.first(where: { $0.name == "error" })?.value {
             return .denied(error: error)
