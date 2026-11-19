@@ -162,14 +162,19 @@ public struct LinkState: Sendable {
     private var authoritative = Ticket(sequence: 0)
     /// Ticket of the newest request outcome (success or billing refusal) applied.
     private var latestOutcome = Ticket(sequence: 0)
-    /// Newest proof the connection was alive when issued: a success, a 402 (the API
-    /// checks the connection before the cap and the org's billing), or a `connected` read.
+    /// Newest proof the connection was alive when issued: a success, a 402, or a
+    /// `connected` read. (That a 402 implies a live connection is inferred from the
+    /// docs, which refuse ended or unlinked connections with 403 `not_billable`.)
     private var connectedEvidence = Ticket(sequence: 0)
     /// Newest `disconnected` / `not_connected` read since the last link/unlink action.
     private var negativeRead: (ticket: Ticket, status: ConnectionStatus, at: EpochMillis)?
     private var probe: (ticket: Ticket, startedAt: EpochMillis)?
     private var failedProbes: Int = 0
     private var everLinked: Bool
+    /// End of the ~10 s propagation window after the latest code exchange. Kept apart
+    /// from `health` so that whether a `not_billable` falls inside the window depends
+    /// only on when it was *sent*, not on which other outcome happened to land first.
+    private var warmupUntil: EpochMillis?
 
     public init(phase: LinkPhase = .notLinked, policy: LinkPolicy = LinkPolicy()) {
         self.policy = policy
@@ -180,6 +185,7 @@ public struct LinkState: Sendable {
             base = .pending(startedAt: startedAt); health = .billable; everLinked = false
         case let .linked(health):
             base = .linked; self.health = health; everLinked = true
+            if case let .warmingUp(until) = health { warmupUntil = until }
         case let .unlinked(reason, at):
             base = .unlinked(reason: reason, at: at); health = .billable; everLinked = true
         }
@@ -221,6 +227,23 @@ public struct LinkState: Sendable {
     public var isWarmingUp: Bool {
         if case .linked(.warmingUp) = phase { return true }
         return false
+    }
+
+    /// Whether a request sent at `sentAt` falls inside the propagation window after
+    /// the latest code exchange (where `not_billable` is retried, not trusted).
+    public func isInWarmup(sentAt: EpochMillis) -> Bool {
+        guard let warmupUntil else { return false }
+        return sentAt < warmupUntil
+    }
+
+    /// The phase as of `now`: like `phase`, but a link flow older than
+    /// `LinkPolicy.pendingTimeoutMillis` already reads as abandoned. Use this for UI
+    /// and scheduling; `phase` only moves when an event is applied.
+    public func phase(at now: EpochMillis) -> LinkPhase {
+        if case let .pending(startedAt) = base, now >= Saturating.add(startedAt, policy.pendingTimeoutMillis) {
+            return everLinked ? .unlinked(reason: nil, detectedAt: Saturating.add(startedAt, policy.pendingTimeoutMillis)) : .notLinked
+        }
+        return phase
     }
 
     // MARK: Admission
@@ -278,25 +301,31 @@ public struct LinkState: Sendable {
     public mutating func apply(_ event: LinkEvent, at now: EpochMillis) -> Bool {
         let before = phase
         if case let .pending(startedAt) = base, now >= Saturating.add(startedAt, policy.pendingTimeoutMillis) {
-            base = everLinked ? .unlinked(reason: nil, at: now) : .notLinked // abandoned flow
+            // Abandoned flow. Like every user-level change, it takes a ticket, so a
+            // status read issued before it is stale whenever it lands.
+            endUserLevelChange()
+            base = everLinked ? .unlinked(reason: nil, at: Saturating.add(startedAt, policy.pendingTimeoutMillis)) : .notLinked
         }
         switch event {
         case .linkStarted:
             if case .linked = phase { break } // re-approving an active link changes nothing
+            endUserLevelChange()
             base = .pending(startedAt: now)
         case .linkCompleted:
-            authoritative = issueTicket()
-            negativeRead = nil
+            endUserLevelChange()
             everLinked = true
             clearProbe(resetFailures: true)
             base = .linked
-            health = .warmingUp(until: Saturating.add(now, policy.warmupMillis))
+            let until = Saturating.add(now, policy.warmupMillis)
+            warmupUntil = until
+            health = .warmingUp(until: until)
         case .linkCancelled:
             guard case .pending = base else { break }
+            endUserLevelChange()
             base = everLinked ? .unlinked(reason: nil, at: now) : .notLinked
         case .unlinkedByApp:
-            authoritative = issueTicket()
-            negativeRead = nil
+            endUserLevelChange()
+            warmupUntil = nil
             clearProbe(resetFailures: true)
             base = .unlinked(reason: .revokedByAppOwner, at: now)
         case let .statusObserved(status, ticket):
@@ -327,6 +356,7 @@ public struct LinkState: Sendable {
                 // Linked from elsewhere (another device or the web).
                 everLinked = true
                 clearProbe(resetFailures: true)
+                warmupUntil = nil
                 base = .linked
                 health = .billable
             }
@@ -358,7 +388,7 @@ public struct LinkState: Sendable {
             if probe?.ticket == ticket { clearProbe(resetFailures: false) }
             return
         }
-        if case let .warmingUp(until) = health, refusal == .notBillable, sentAt < until {
+        if refusal == .notBillable, isInWarmup(sentAt: sentAt) {
             return // the docs' ~10 s propagation window: retry, don't degrade
         }
         let wasProbe = probe?.ticket == ticket
@@ -398,6 +428,13 @@ public struct LinkState: Sendable {
         latestOutcome = ticket
         clearProbe(resetFailures: true)
         health = .billable
+    }
+
+    /// A link, unlink, start, cancel or expiry: everything issued before it is stale,
+    /// and any negative read belongs to the previous flow.
+    private mutating func endUserLevelChange() {
+        authoritative = issueTicket()
+        negativeRead = nil
     }
 
     private mutating func clearProbe(resetFailures: Bool) {

@@ -165,6 +165,12 @@ public actor LinkedBillingGateway {
         link.apply(.statusObserved(status, ticket: ticket), at: clock.now())
     }
 
+    /// The link's phase as of now, with an abandoned link flow already expired. Prefer
+    /// this to `link.phase` for UI and scheduling.
+    public func currentPhase() -> LinkPhase {
+        link.phase(at: clock.now())
+    }
+
     /// What the router would decide right now, without sending or reserving.
     public func preview(_ request: InferenceRequest) -> RouteDecision {
         decide(request, at: clock.now())
@@ -230,7 +236,7 @@ public actor LinkedBillingGateway {
                                                    result: .refused(refusal, discardedPartialReply: partial != nil)))
                     // Recommend a status read only when the refusal could mean an ended link:
                     // inside the warm-up window it is expected propagation delay.
-                    if refusal == .notBillable, !link.isWarmingUp { statusCheck = true }
+                    if refusal == .notBillable, !link.isInWarmup(sentAt: now) { statusCheck = true }
 
                     if case let .overloaded(retryAfter) = refusal {
                         let wait = overloadDelay(retryAfterSeconds: retryAfter, retry: overloadRetries)
@@ -243,7 +249,7 @@ public actor LinkedBillingGateway {
                     }
                     guard refusal.isCustomerBillingSignal else { return finish(.failed(.rejected(refusal))) }
 
-                    if refusal == .notBillable, case .linked(.warmingUp) = link.phase {
+                    if refusal == .notBillable, link.isInWarmup(sentAt: now) {
                         // Inside the ~10 s propagation window the state ignored the
                         // refusal; re-send to the customer once, after a short wait.
                         // A second refusal stops trying the customer for this request.

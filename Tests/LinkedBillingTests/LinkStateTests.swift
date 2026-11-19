@@ -395,6 +395,34 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.phase, .unlinked(reason: .revokedByAdmin, detectedAt: t0))
     }
 
+    func testAReadInFlightDuringALinkFlowIsStaleWhetherItLandsBeforeOrAfterCancel() {
+        for status in [ConnectionStatus.connected, .disconnected(revokedAt: nil, reason: .other)] {
+            var phases: [LinkPhase] = []
+            for readFirst in [true, false] {
+                var state = LinkState()
+                state.apply(.linkStarted, at: t0)
+                let read = state.issueTicket()
+                if readFirst {
+                    state.apply(.statusObserved(status, ticket: read), at: t0 + 1)
+                    state.apply(.linkCancelled, at: t0 + 2)
+                } else {
+                    state.apply(.linkCancelled, at: t0 + 1)
+                    state.apply(.statusObserved(status, ticket: read), at: t0 + 2)
+                }
+                phases.append(state.phase)
+            }
+            XCTAssertEqual(phases, [.notLinked, .notLinked], "\(status)")
+        }
+    }
+
+    func testPhaseAtNowShowsAnAbandonedFlowWithoutAnEvent() {
+        var state = LinkState()
+        state.apply(.linkStarted, at: t0)
+        XCTAssertEqual(state.phase(at: t0 + 10 * 60_000 - 1), .linkPending(startedAt: t0))
+        XCTAssertEqual(state.phase(at: t0 + 10 * 60_000), .notLinked)
+        XCTAssertEqual(state.phase, .linkPending(startedAt: t0)) // unchanged until an event
+    }
+
     func testAnAbandonedLinkFlowExpires() {
         var state = LinkState()
         state.apply(.linkStarted, at: t0)
@@ -427,6 +455,39 @@ final class LinkStateTests: XCTestCase {
         // Sent at 9.5 s, refused at 10.5 s: still inside the window that matters.
         state.apply(.customerRefused(.notBillable, ticket: state.issueTicket(), sentAt: t0 + 9_500), at: t0 + 10_500)
         XCTAssertEqual(state.phase, .linked(.warmingUp(until: t0 + 10_000)))
+    }
+
+    func testAWarmUpRefusalIsJudgedTheSameWhicheverOutcomeLandsFirst() {
+        // Two requests inside the window: Q1 (issued first) and Q2 (403 not_billable).
+        for q1 in [LinkEvent.customerBilled(ticket: Ticket(sequence: 0)), .customerRefused(.spendLimitReached, ticket: Ticket(sequence: 0))] {
+            var phases: [LinkPhase] = []
+            for q1First in [true, false] {
+                var state = LinkState()
+                state.apply(.linkCompleted, at: t0)
+                let first = state.issueTicket()
+                let second = state.issueTicket()
+                let firstEvent: LinkEvent
+                switch q1 {
+                case .customerBilled: firstEvent = .customerBilled(ticket: first)
+                default: firstEvent = .customerRefused(.spendLimitReached, ticket: first, sentAt: t0 + 1)
+                }
+                let secondEvent = LinkEvent.customerRefused(.notBillable, ticket: second, sentAt: t0 + 2)
+                if q1First {
+                    state.apply(firstEvent, at: t0 + 3); state.apply(secondEvent, at: t0 + 4)
+                } else {
+                    state.apply(secondEvent, at: t0 + 3); state.apply(firstEvent, at: t0 + 4)
+                }
+                phases.append(state.phase)
+            }
+            XCTAssertEqual(phases.count, 2)
+            guard phases.count == 2 else { return }
+            switch (phases[0], phases[1]) {
+            case (.linked(.billable), .linked(.billable)), (.linked(.spendLimitReached), .linked(.spendLimitReached)):
+                break
+            default:
+                XCTFail("arrival order changed the result: \(phases)")
+            }
+        }
     }
 
     func testOtherRefusalsDegradeEvenDuringWarmUp() {

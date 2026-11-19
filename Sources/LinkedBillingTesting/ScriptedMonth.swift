@@ -98,7 +98,7 @@ public actor ScriptedMonth {
     public func snapshot() async -> Snapshot {
         let ledger = await gateway.ledger
         let now = clock.now()
-        return Snapshot(phase: await gateway.link.phase, now: now,
+        return Snapshot(phase: await gateway.currentPhase(), now: now,
                         thisMonth: ledger.totals(for: BillingMonth(containing: now)),
                         months: ledger.months.map { ($0, ledger.totals(for: $0)) },
                         entries: ledger.recentEntries)

@@ -26,7 +26,7 @@ Sending that field is the easy part. This package handles what the docs warn you
 
 "Who pays for inference" is an architecture decision, not a pricing slide. Once it can change per request, every layer is affected: auth (an OAuth link the app starts and the back end completes), routing (a decision that depends on plan, link health and budgets), failure semantics (three new refusals, each needing a different response) and state (a link that can end without any notification). Teams that treat it as a header flag find that out one support ticket at a time.
 
-The design uses a pure decision core, one actor that owns all mutable state, and explicit ordering for results that arrive late. Every concurrency and money claim below is pinned by a test, and each of those tests is checked against a deliberately broken implementation (73 mutants, run in CI).
+The design uses a pure decision core, one actor that owns all mutable state, and explicit ordering for results that arrive late. Every concurrency and money claim below is pinned by a test, and each of those tests is checked against a deliberately broken implementation (75 mutants, run in CI).
 
 ## How it fits together
 
@@ -95,7 +95,7 @@ stateDiagram-v2
 2. Of two request outcomes, the one **issued** later wins. Arrival order doesn't decide it. A stale success can't clear a newer refusal, and a stale refusal can't undo a newer recovery.
 3. While degraded, at most one probe is in flight. A refusal from an older, non-probe request doesn't cancel it. A probe that never reports expires after `probeTimeoutMillis` (10 min by default; keep it above your transport's request timeout).
 4. A spend-limit probe is never scheduled after 00:00 UTC on the 1st.
-5. `connection_status: unknown` never changes state. `connected` never overrides health observed from requests (the docs say `connected` "doesn't promise that a request will succeed"). A `disconnected` or `not_connected` read issued before a request that proved the connection alive (a success, or a 402, since the API checks the connection first) doesn't unlink. Between a negative read and any proof the connection was alive (a success, a 402, or a `connected` read), the one *issued* later decides, in any arrival order.
+5. `connection_status: unknown` never changes state. `connected` never overrides health observed from requests (the docs say `connected` "doesn't promise that a request will succeed"). A `disconnected` or `not_connected` read issued before a request that proved the connection alive (a success, or a 402: the docs refuse ended connections with 403 `not_billable`, so a 402 is taken as proof the connection was alive) doesn't unlink. Between a negative read and any proof the connection was alive (a success, a 402, or a `connected` read), the one *issued* later decides, in any arrival order.
 
 ## Design decisions and trade-offs
 
@@ -111,8 +111,8 @@ stateDiagram-v2
 
 ## Verification
 
-- **131 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
-- **73 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
+- **134 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
+- **75 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
 - **CI** ([Actions](../../actions)) runs a clean Linux build and tests on Swift 6.0 with warnings as errors, macOS tests plus a generic iOS Simulator build of both products, and the mutation check.
 - **The scripted month the demo plays is tested directly** (`ScriptedMonthTests`), so the numbers in the demo's screenshots are asserted, not hand-copied.
 
@@ -125,7 +125,8 @@ stateDiagram-v2
 - **Batches and streaming aren't modelled.** Message Batches can't bill a customer (the docs say such requests are refused), and the router doesn't know about batches: send them as app-paid. A `billing_unavailable` that arrives mid-stream comes as an error event after a 200, and your transport has to map it to `.refused(.billingUnavailable, partialReply:)`.
 - **Only Anthropic's `503 overloaded_error` is retried**, and only while each wait fits `RetryLimits.maxRetryWaitMillis` (30 s by default). A longer `retry-after` fails the request as `.overloaded` instead of holding the caller. A 503 without that error type (a proxy, a load balancer) may have taken effect, so it decodes to `.other` and isn't retried. 429 and 529 also decode to `.other`. Put your general rate-limit retry policy in the transport.
 - **The OAuth redirect must be https on your proven domain** (docs: every redirect URI is on the domain you prove, except `localhost`). On iOS, `ASWebAuthenticationSession` can receive an https callback with `.https(host:path:)` from iOS 17.4; on 17.0–17.3, let your back end receive the callback and validate `state` there with the same checks. `LinkSession` validates whichever redirect you register; the demo and tests use an https one.
-- **An abandoned link flow expires.** Nothing tells the app when a user closes the sign-in sheet, so a pending link is treated as abandoned after `LinkPolicy.pendingTimeoutMillis` (10 min, the pushed request's lifetime).
+- **An abandoned link flow expires.** Nothing tells the app when a user closes the sign-in sheet, so a pending link is treated as abandoned after `LinkPolicy.pendingTimeoutMillis` (10 min, the pushed request's lifetime). Read `LinkState.phase(at:)` or `LinkedBillingGateway.currentPhase()` for UI; `phase` itself only moves when an event is applied.
+- **"A 402 proves the connection was alive" is an inference.** The docs say an ended or unlinked connection is refused with 403 `user_profile_not_billable`; they don't spell out the order of the server's checks. The unlink logic relies on that reading.
 - **`LinkSession` trusts one clock.** Pass `createdAt` from the same clock you pass as `now`. A 60 s tolerance absorbs small adjustments; a back-end timestamp on a device whose clock is minutes behind would expire the callback.
 - **A link found by a status read skips the warm-up.** If `connection_status` reports `connected` for a customer the gateway thought was unlinked (they linked elsewhere), the first `not_billable` inside ~10 s degrades the link instead of being retried.
 - **App-side unlink is assumed to succeed.** `LinkEvent.unlinkedByApp` should be applied after `POST /v1/user_profiles/{id}/unlink` returns 200. The docs' partial-unlink-on-503 recovery is yours to implement.
@@ -136,7 +137,7 @@ stateDiagram-v2
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.3.0")
+.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.4.0")
 ```
 
 ```swift

@@ -112,7 +112,7 @@ public actor ConnectionReconciler {
 
     /// Delay until the next scheduled read, given a random draw for jitter.
     public func nextDelay(jitterDraw: UInt64) async -> Int64 {
-        let phase = await gateway.link.phase
+        let phase = await gateway.currentPhase()
         return schedule.delay(for: phase, consecutiveFailures: consecutiveFailures, jitterDraw: jitterDraw)
     }
 
