@@ -46,7 +46,8 @@ public struct LinkPolicy: Hashable, Sendable {
 }
 
 /// Monotonic ordering token. Every request, status read and user action takes one
-/// from the same `LinkState`, so "which happened first" is decided by issue order,
+/// from the same `LinkState` (including a link start that leaves an active link in
+/// place, and the expiry of an abandoned link flow), so "which happened first" is decided by issue order,
 /// never by wall-clock timestamps that can tie or go backwards. This is what makes
 /// results that arrive late (after an actor suspension) safe to apply.
 public struct Ticket: Hashable, Comparable, Sendable {
@@ -131,10 +132,23 @@ public enum LinkEvent: Hashable, Sendable {
 ///   success, a 402, or a `connected` read). Whichever was *issued* later decides.
 ///
 /// Every input is folded in with a ticket comparison against a running maximum, so
-/// the final state doesn't depend on the order results *arrive* in.
+/// the final state doesn't depend on the order results *arrive* in. Time-driven
+/// changes (an abandoned link flow expiring) are folded by `settle(at:)`, which every
+/// ticket-issuing entry point calls first, so the expiry is ordered before any ticket
+/// issued after it and after any ticket issued before it.
+///
+/// One case is inherently ambiguous and is resolved by a fresh read instead: a
+/// `connected` read issued just *before* the user starts a link flow. If it lands first
+/// it links the profile (and the flow's start leaves the link in place); if the flow
+/// starts first, the read is stale. After a cancel or an expired flow, take a fresh
+/// read (`ConnectionReconciler.linkCancelled()` does both).
 ///
 /// Invariants (each has a test, and a mutant in `scripts/mutation-check.sh`):
-/// 1. A result issued before the latest link/unlink action never changes state.
+/// 1. A result issued before the latest link/unlink action (or, for a status read,
+///    before a re-approval) never changes `base`, `health` or the evidence. The one
+///    thing a stale read still records is that a `disconnected` profile was once
+///    linked, a permanent fact that decides whether an abandoned flow reads as
+///    `.notLinked` or `.unlinked`.
 /// 2. Of two request outcomes, the one issued later wins: a success issued before
 ///    the refusal that degraded the link never un-degrades it, and a refusal issued
 ///    before a recovering success never re-degrades it, in any arrival order.
@@ -149,6 +163,11 @@ public struct LinkState: Sendable {
     private enum Base: Sendable {
         case notLinked
         case pending(startedAt: EpochMillis)
+        /// A link flow that was cancelled or expired at `at`. Whether it reads as
+        /// `.notLinked` or `.unlinked` is derived from `everLinked` when `phase` is read,
+        /// not fixed at cancel time, so a `disconnected` read that lands after the cancel
+        /// gives the same answer as one that landed before it.
+        case abandoned(at: EpochMillis)
         case linked
         case unlinked(reason: ConnectionStatus.RevocationReason?, at: EpochMillis)
     }
@@ -160,6 +179,9 @@ public struct LinkState: Sendable {
     private var nextSequence: UInt64 = 1
     /// Ticket of the latest link/unlink action. Older results are stale.
     private var authoritative = Ticket(sequence: 0)
+    /// Ticket of the latest link start that left an active link in place (a re-approval).
+    /// Status reads issued before it are stale; request outcomes are not.
+    private var readFloor = Ticket(sequence: 0)
     /// Ticket of the newest request outcome (success or billing refusal) applied.
     private var latestOutcome = Ticket(sequence: 0)
     /// Newest proof the connection was alive when issued: a success, a 402, or a
@@ -201,6 +223,11 @@ public struct LinkState: Sendable {
             return .notLinked
         case let .pending(startedAt):
             return .linkPending(startedAt: startedAt)
+        case let .abandoned(at):
+            if let read = negativeRead, case let .disconnected(_, reason) = read.status {
+                return .unlinked(reason: reason, detectedAt: read.at)
+            }
+            return everLinked ? .unlinked(reason: nil, detectedAt: at) : .notLinked
         case let .unlinked(reason, at):
             return .unlinked(reason: reason, detectedAt: at)
         case .linked:
@@ -214,7 +241,27 @@ public struct LinkState: Sendable {
         }
     }
 
-    /// Issue the next ordering token.
+    /// Fold time-driven changes as of `now`: a link flow older than
+    /// `LinkPolicy.pendingTimeoutMillis` becomes abandoned, and the abandonment takes a
+    /// ticket (so status reads issued before it are stale, and reads issued after it
+    /// count). Call it before issuing a ticket at `now`; `issueTicket(at:)`, `apply` and
+    /// the gateway all do.
+    public mutating func settle(at now: EpochMillis) {
+        guard case let .pending(startedAt) = base else { return }
+        let expiry = Saturating.add(startedAt, policy.pendingTimeoutMillis)
+        guard now >= expiry else { return }
+        endUserLevelChange()
+        base = .abandoned(at: expiry)
+    }
+
+    /// `settle(at: now)`, then issue the next ordering token. Prefer this to
+    /// `issueTicket()` whenever you know the time.
+    public mutating func issueTicket(at now: EpochMillis) -> Ticket {
+        settle(at: now)
+        return issueTicket()
+    }
+
+    /// Issue the next ordering token, without settling time-driven changes first.
     public mutating func issueTicket() -> Ticket {
         let ticket = Ticket(sequence: nextSequence)
         // UInt64 wraps only after 1.8e19 issues; &+= documents that it is not a trap.
@@ -224,8 +271,17 @@ public struct LinkState: Sendable {
 
     public var probeInFlight: Bool { probe != nil }
 
+    /// Kept for source compatibility. It never ends the window on its own (it reads the
+    /// event-driven `phase`); use `isWarmingUp(at:)`.
+    @available(*, deprecated, message: "Use isWarmingUp(at:), which ends the window on time.")
     public var isWarmingUp: Bool {
         if case .linked(.warmingUp) = phase { return true }
+        return false
+    }
+
+    /// Whether the link reads as still inside the propagation window at `now`.
+    public func isWarmingUp(at now: EpochMillis) -> Bool {
+        if case .linked(.warmingUp) = phase(at: now) { return true }
         return false
     }
 
@@ -236,14 +292,17 @@ public struct LinkState: Sendable {
         return sentAt < warmupUntil
     }
 
-    /// The phase as of `now`: like `phase`, but a link flow older than
-    /// `LinkPolicy.pendingTimeoutMillis` already reads as abandoned. Use this for UI
-    /// and scheduling; `phase` only moves when an event is applied.
+    /// The phase as of `now`: like `phase`, but with time already applied. A link flow
+    /// older than `LinkPolicy.pendingTimeoutMillis` reads as abandoned, and a warm-up
+    /// window that has ended reads as `.billable`. Use this for UI and scheduling;
+    /// `phase` only moves when an event is applied.
     public func phase(at now: EpochMillis) -> LinkPhase {
         if case let .pending(startedAt) = base, now >= Saturating.add(startedAt, policy.pendingTimeoutMillis) {
             return everLinked ? .unlinked(reason: nil, detectedAt: Saturating.add(startedAt, policy.pendingTimeoutMillis)) : .notLinked
         }
-        return phase
+        let current = phase
+        if case let .linked(.warmingUp(until)) = current, now >= until { return .linked(.billable) }
+        return current
     }
 
     // MARK: Admission
@@ -296,19 +355,23 @@ public struct LinkState: Sendable {
 
     // MARK: Transitions
 
-    /// Apply an event. Returns `true` if the phase changed.
+    /// Apply an event. Returns `true` if `phase(at: now)` changed, so time-driven changes
+    /// that `phase(at:)` already showed don't count.
     @discardableResult
     public mutating func apply(_ event: LinkEvent, at now: EpochMillis) -> Bool {
-        let before = phase
-        if case let .pending(startedAt) = base, now >= Saturating.add(startedAt, policy.pendingTimeoutMillis) {
-            // Abandoned flow. Like every user-level change, it takes a ticket, so a
-            // status read issued before it is stale whenever it lands.
-            endUserLevelChange()
-            base = everLinked ? .unlinked(reason: nil, at: Saturating.add(startedAt, policy.pendingTimeoutMillis)) : .notLinked
-        }
+        let before = phase(at: now)
+        settle(at: now)
         switch event {
         case .linkStarted:
-            if case .linked = phase { break } // re-approving an active link changes nothing
+            if case .linked = base {
+                // Re-approving an active link (e.g. a scope change) leaves it in place.
+                // Judged on `base`, not `phase`, so whether an earlier negative read has
+                // landed yet can't change the outcome: reads issued before the
+                // re-approval are stale either way.
+                readFloor = issueTicket()
+                negativeRead = nil
+                break
+            }
             endUserLevelChange()
             base = .pending(startedAt: now)
         case .linkCompleted:
@@ -322,14 +385,18 @@ public struct LinkState: Sendable {
         case .linkCancelled:
             guard case .pending = base else { break }
             endUserLevelChange()
-            base = everLinked ? .unlinked(reason: nil, at: now) : .notLinked
+            base = .abandoned(at: now)
         case .unlinkedByApp:
             endUserLevelChange()
             warmupUntil = nil
             clearProbe(resetFailures: true)
             base = .unlinked(reason: .revokedByAppOwner, at: now)
         case let .statusObserved(status, ticket):
-            guard ticket > authoritative else { break } // read began before a link/unlink
+            // `disconnected` means the profile had a connection that ended: a permanent
+            // fact about the profile, recorded even when the read itself is stale.
+            if case .disconnected = status { everLinked = true }
+            // Stale if it began before a link/unlink action or a re-approval.
+            guard ticket > max(authoritative, readFloor) else { break }
             applyStatus(status, ticket: ticket, now: now)
         case let .customerRefused(refusal, ticket, sentAt):
             applyRefusal(refusal, ticket: ticket, sentAt: sentAt ?? now, now: now)
@@ -338,7 +405,7 @@ public struct LinkState: Sendable {
         case let .probeAbandoned(ticket):
             if probe?.ticket == ticket { clearProbe(resetFailures: false) }
         }
-        return phase != before
+        return phase(at: now) != before
     }
 
     private mutating func applyStatus(_ status: ConnectionStatus, ticket: Ticket, now: EpochMillis) {
@@ -352,7 +419,7 @@ public struct LinkState: Sendable {
             switch base {
             case .linked, .pending:
                 return // a pending OAuth flow is still the user's to finish or cancel
-            case .notLinked, .unlinked:
+            case .notLinked, .abandoned, .unlinked:
                 // Linked from elsewhere (another device or the web).
                 everLinked = true
                 clearProbe(resetFailures: true)
@@ -362,7 +429,6 @@ public struct LinkState: Sendable {
             }
         case .disconnected, .notConnected:
             if case .pending = base { return } // an old link ended; the new one is in progress
-            if case .disconnected = status { everLinked = true }
             // Keep only the newest negative read; `phase` compares it with the newest
             // positive evidence.
             if let current = negativeRead, current.ticket > ticket { return }

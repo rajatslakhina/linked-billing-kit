@@ -124,13 +124,15 @@ public enum BillingRefusal: Hashable, Sendable {
         }
     }
 
-    /// `retry-after` in delta-seconds, clamped to 0...3600. An HTTP-date or garbage
-    /// value yields `nil` (the caller falls back to its own backoff).
+    /// `retry-after` in delta-seconds, clamped to 0...3600. Any all-digit value too long
+    /// to parse is still a delay, so it clamps to 3600 too (and is never shorter than a
+    /// smaller value). An HTTP-date or garbage value yields `nil` (the caller falls back
+    /// to its own backoff).
     static func parseRetryAfter(_ raw: String?) -> Int64? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespaces),
-              !raw.isEmpty, raw.count <= 10,
-              raw.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
-              let seconds = Int64(raw) else { return nil }
+        guard let raw = raw?.trimmingCharacters(in: .whitespaces), !raw.isEmpty,
+              raw.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
+        // Ten digits always fit in Int64; anything longer is at least 10^10 s.
+        guard raw.utf8.count <= 10, let seconds = Int64(raw) else { return 3600 }
         return min(seconds, 3600)
     }
 

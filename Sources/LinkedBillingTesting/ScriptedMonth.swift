@@ -250,7 +250,7 @@ public actor ScriptedMonth {
             }
         }
         return StepRecord(id: index, title: step.title, narrative: step.narrative, clock: clock.now(),
-                          requests: requests, phaseAfter: await gateway.link.phase, note: note)
+                          requests: requests, phaseAfter: await gateway.currentPhase(), note: note)
     }
 
     private static func isServed(_ result: GatewayResult) -> Bool {

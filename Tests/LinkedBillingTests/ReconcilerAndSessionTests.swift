@@ -85,6 +85,43 @@ final class ConnectionReconcilerTests: XCTestCase {
         guard case .linked = await gw.link.phase else { return XCTFail("stale read reverted the new link") }
     }
 
+    func testTheFirstReadAfterAnAbandonedFlowCounts() async {
+        // The customer finished linking elsewhere, but this app never applied
+        // `.linkCompleted`. The flow expires; the next read must still link the profile.
+        let clock = ManualClock(start)
+        let org = SimulatedClaudeOrg(clock: clock)
+        await org.link()
+        let gw = gateway(clock: clock)
+        let reconciler = ConnectionReconciler(gateway: gw, source: org)
+        await gw.apply(.linkStarted)
+        clock.advance(by: 11 * 60_000)
+        let result = await reconciler.reconcileNow()
+        XCTAssertEqual(result, .observed(.connected, phaseChanged: true))
+        let phase = await gw.currentPhase()
+        XCTAssertEqual(phase, .linked(.billable))
+    }
+
+    func testLinkCancelledTakesAFreshReadAfterTheCancel() async {
+        // A `connected` read issued before the flow started is stale once the flow
+        // starts; `linkCancelled()` replaces it with a read issued after the cancel.
+        let clock = ManualClock(start)
+        let source = ControlledStatusSource()
+        let gw = gateway(clock: clock)
+        let reconciler = ConnectionReconciler(gateway: gw, source: source)
+        let early = Task { await reconciler.reconcileNow() }
+        await waitUntil { await source.waitingCount == 1 }
+        await gw.apply(.linkStarted)
+        await source.release(.connected)                      // stale: issued before the start
+        _ = await early.value
+        let cancelled = Task { await reconciler.linkCancelled() }
+        await waitUntil { await source.waitingCount == 1 }    // the fresh read
+        await source.release(.connected)
+        let result = await cancelled.value
+        XCTAssertEqual(result, .observed(.connected, phaseChanged: true))
+        let phase = await gw.currentPhase()
+        XCTAssertEqual(phase, .linked(.billable))
+    }
+
     func testAnUnlinkWithNoWebhookIsDiscoveredByTheRead() async throws {
         let clock = ManualClock(start)
         let org = SimulatedClaudeOrg(clock: clock)

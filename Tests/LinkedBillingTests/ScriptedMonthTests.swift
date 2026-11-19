@@ -92,6 +92,14 @@ final class ScriptedMonthTests: XCTestCase {
         XCTAssertTrue(steps[9].note?.contains("2026-11 closed: customer org $2.70") ?? false)
     }
 
+    func testLoweringTheHoldTargetNeverTraps() async {
+        let org = SimulatedClaudeOrg(clock: ManualClock(0))
+        await org.configure { $0.holdUntilInFlight = Int.min }
+        await org.lowerHoldTarget()
+        let target = await org.holdUntilInFlight
+        XCTAssertEqual(target, 1)
+    }
+
     func testTheRouterMatrixMatchesThePrecedenceRules() throws {
         let configuration = try Self.configuration()
         let rows = ScriptedMonth.matrix(for: configuration)

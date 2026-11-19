@@ -157,8 +157,10 @@ public actor LinkedBillingGateway {
         link.apply(event, at: clock.now())
     }
 
-    /// Start a `connection_status` read. Pass the ticket back with the result.
-    public func beginStatusRead() -> Ticket { link.issueTicket() }
+    /// Start a `connection_status` read. Pass the ticket back with the result. Time-driven
+    /// changes (an abandoned link flow expiring) are folded first, so a read that starts
+    /// after the expiry always counts.
+    public func beginStatusRead() -> Ticket { link.issueTicket(at: clock.now()) }
 
     @discardableResult
     public func observeStatus(_ status: ConnectionStatus, ticket: Ticket) -> Bool {
@@ -202,7 +204,7 @@ public actor LinkedBillingGateway {
                 return finish(.paused(reason))
 
             case let .billCustomer(profile, model, isProbe):
-                let ticket = link.issueTicket()
+                let ticket = link.issueTicket(at: now)
                 if isProbe, !link.beginProbe(ticket: ticket, at: now) {
                     // Unreachable while `decide` and `beginProbe` run in one actor turn,
                     // but if it ever happens, re-route rather than send a second probe.

@@ -132,7 +132,7 @@ public actor SimulatedClaudeOrg: MessagesTransport, ConnectionStatusSource {
     /// remaining one is now in flight.
     public func lowerHoldTarget() {
         guard let target = holdUntilInFlight else { return }
-        let lowered = max(1, target - 1)
+        let lowered = target > 1 ? target - 1 : 1 // no `target - 1` trap at Int.min
         holdUntilInFlight = lowered
         if inFlight >= lowered { releaseHeld() }
     }

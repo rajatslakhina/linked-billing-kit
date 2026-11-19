@@ -402,16 +402,16 @@ final class LinkStateTests: XCTestCase {
                 var state = LinkState()
                 state.apply(.linkStarted, at: t0)
                 let read = state.issueTicket()
-                if readFirst {
-                    state.apply(.statusObserved(status, ticket: read), at: t0 + 1)
-                    state.apply(.linkCancelled, at: t0 + 2)
-                } else {
-                    state.apply(.linkCancelled, at: t0 + 1)
-                    state.apply(.statusObserved(status, ticket: read), at: t0 + 2)
-                }
+                if readFirst { state.apply(.statusObserved(status, ticket: read), at: t0 + 1) }
+                state.apply(.linkCancelled, at: t0 + 2)
+                if !readFirst { state.apply(.statusObserved(status, ticket: read), at: t0 + 3) }
                 phases.append(state.phase)
             }
-            XCTAssertEqual(phases, [.notLinked, .notLinked], "\(status)")
+            // The read never changes base or health. A `disconnected` one still records
+            // (in either order) that the profile was once linked, so the cancelled
+            // flow reads as unlinked rather than never-linked.
+            let expected: LinkPhase = status == .connected ? .notLinked : .unlinked(reason: nil, detectedAt: t0 + 2)
+            XCTAssertEqual(phases, [expected, expected], "\(status)")
         }
     }
 
@@ -421,6 +421,98 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.phase(at: t0 + 10 * 60_000 - 1), .linkPending(startedAt: t0))
         XCTAssertEqual(state.phase(at: t0 + 10 * 60_000), .notLinked)
         XCTAssertEqual(state.phase, .linkPending(startedAt: t0)) // unchanged until an event
+    }
+
+    func testAReadIssuedAfterAFlowExpiredCounts() {
+        // The expiry is folded (and takes its ticket) before the read's ticket is issued,
+        // so the first read after an abandoned flow is never thrown away.
+        var state = LinkState()
+        state.apply(.linkStarted, at: t0)
+        let later = t0 + 11 * 60_000
+        let read = state.issueTicket(at: later)
+        XCTAssertTrue(state.apply(.statusObserved(.connected, ticket: read), at: later + 500))
+        XCTAssertEqual(state.phase, .linked(.billable))
+    }
+
+    func testAReadIssuedBeforeAFlowExpiredIsStaleWheneverItLands() {
+        for settledFirst in [false, true] {
+            var state = LinkState()
+            state.apply(.linkStarted, at: t0)
+            let read = state.issueTicket(at: t0 + 60_000) // during the flow
+            if settledFirst { state.settle(at: t0 + 10 * 60_000) }
+            state.apply(.statusObserved(.connected, ticket: read), at: t0 + 10 * 60_000 + 1)
+            XCTAssertEqual(state.phase, .notLinked, "settledFirst \(settledFirst)")
+        }
+    }
+
+    func testReapprovingAnActiveLinkGivesTheSameStateInEitherArrivalOrder() {
+        // A negative read issued before a re-approval is stale whether it lands before or
+        // after the re-approval starts.
+        var phases: [LinkPhase] = []
+        var admissions: [CustomerAdmission] = []
+        for readFirst in [true, false] {
+            var state = billableLink()
+            let read = state.issueTicket()
+            let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
+            if readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
+            state.apply(.linkStarted, at: t0 + 1)
+            if !readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0 + 2) }
+            phases.append(state.phase)
+            admissions.append(state.admission(at: t0 + 3))
+        }
+        XCTAssertEqual(phases, [.linked(.billable), .linked(.billable)])
+        XCTAssertEqual(admissions, [.admit, .admit])
+    }
+
+    func testAReapprovalDoesNotMakeInFlightRequestOutcomesStale() {
+        var state = billableLink()
+        let request = state.issueTicket()
+        state.apply(.linkStarted, at: t0)                 // re-approval, link stays
+        state.apply(.customerRefused(.spendLimitReached, ticket: request), at: t0 + 1)
+        guard case .linked(.spendLimitReached) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
+    func testCancellingAfterADisconnectedReadGivesTheSameStateInAnyArrivalOrder() {
+        // Read D (`disconnected`) is issued before the user taps Link, then Cancel.
+        let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
+        var phases: [LinkPhase] = []
+        for landing in 0..<3 { // 0: before the start, 1: during the flow, 2: after the cancel
+            var state = LinkState()
+            let read = state.issueTicket()
+            if landing == 0 { state.apply(.statusObserved(negative, ticket: read), at: t0) }
+            state.apply(.linkStarted, at: t0 + 1)
+            if landing == 1 { state.apply(.statusObserved(negative, ticket: read), at: t0 + 2) }
+            state.apply(.linkCancelled, at: t0 + 3)
+            if landing == 2 { state.apply(.statusObserved(negative, ticket: read), at: t0 + 4) }
+            phases.append(state.phase)
+        }
+        XCTAssertEqual(phases, Array(repeating: .unlinked(reason: nil, detectedAt: t0 + 3), count: 3))
+    }
+
+    func testAnExpiredFlowAfterADisconnectedReadGivesTheSameStateInEitherOrder() {
+        let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .other)
+        let expiry = t0 + 1 + 10 * 60_000
+        var phases: [LinkPhase] = []
+        for readFirst in [true, false] {
+            var state = LinkState()
+            let read = state.issueTicket()
+            state.apply(.linkStarted, at: t0 + 1)
+            if readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0 + 2) }
+            state.settle(at: expiry + 5)
+            if !readFirst { state.apply(.statusObserved(negative, ticket: read), at: expiry + 6) }
+            phases.append(state.phase)
+        }
+        XCTAssertEqual(phases, [.unlinked(reason: nil, detectedAt: expiry), .unlinked(reason: nil, detectedAt: expiry)])
+    }
+
+    func testTheWarmUpEndsInPhaseAtNowWithoutAnEvent() {
+        var state = LinkState()
+        state.apply(.linkStarted, at: t0)
+        state.apply(.linkCompleted, at: t0)
+        XCTAssertEqual(state.phase(at: t0 + 9_999), .linked(.warmingUp(until: t0 + 10_000)))
+        XCTAssertTrue(state.isWarmingUp(at: t0 + 9_999))
+        XCTAssertEqual(state.phase(at: t0 + 10_000), .linked(.billable))
+        XCTAssertFalse(state.isWarmingUp(at: t0 + 3_600_000))
     }
 
     func testAnAbandonedLinkFlowExpires() {

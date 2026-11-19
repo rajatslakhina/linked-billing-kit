@@ -110,6 +110,17 @@ public actor ConnectionReconciler {
         return result
     }
 
+    /// The user cancelled the link flow: apply `.linkCancelled`, then take a fresh read.
+    ///
+    /// A cancelled flow leaves the profile in whatever state it was in before the flow,
+    /// and a status read that was already in flight when the flow started is stale, so
+    /// the only reliable way to learn that state is a read issued after the cancel.
+    /// (Call `reconcileNow(fresh: true)` the same way after a flow expires.)
+    public func linkCancelled() async -> ReconcileResult {
+        await gateway.apply(.linkCancelled)
+        return await reconcileNow(fresh: true)
+    }
+
     /// Delay until the next scheduled read, given a random draw for jitter.
     public func nextDelay(jitterDraw: UInt64) async -> Int64 {
         let phase = await gateway.currentPhase()

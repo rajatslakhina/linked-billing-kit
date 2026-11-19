@@ -91,7 +91,7 @@ stateDiagram-v2
 
 `LinkState` is a synchronous value type with no I/O and no clock (callers pass `now`). Its invariants are listed in the source, and each one has a test and a mutant:
 
-1. A result issued before the latest link/unlink action never changes state.
+1. A result issued before the latest link/unlink action never changes state (nor does a status read issued before a re-approval of an active link). The one exception is permanent: a stale `disconnected` read still records that the profile was once linked, which decides whether a cancelled or expired flow reads as "not linked" or "unlinked", so that answer doesn't depend on when the read lands either.
 2. Of two request outcomes, the one **issued** later wins. Arrival order doesn't decide it. A stale success can't clear a newer refusal, and a stale refusal can't undo a newer recovery.
 3. While degraded, at most one probe is in flight. A refusal from an older, non-probe request doesn't cancel it. A probe that never reports expires after `probeTimeoutMillis` (10 min by default; keep it above your transport's request timeout).
 4. A spend-limit probe is never scheduled after 00:00 UTC on the 1st.
@@ -99,7 +99,7 @@ stateDiagram-v2
 
 ## Design decisions and trade-offs
 
-- **Ordering by ticket, not by timestamp.** Every request, status read and link action takes a `Ticket` from the same counter before it suspends. Wall-clock timestamps can tie, go backwards, or come from a different machine. The ticket makes "issued later" well defined, so a result that lands after an actor suspension can't undo newer evidence. *Trade-off:* ticket order is the client's issue order, not the server's processing order. See the limits below. *Rejected:* serialising all requests per customer, which is correct but turns one slow call into head-of-line blocking for the whole customer.
+- **Ordering by ticket, not by timestamp.** Every request, status read and link action (including a link start that leaves an active link in place, and the expiry of an abandoned flow) takes a `Ticket` from the same counter before it suspends. The expiry is folded in by `LinkState.settle(at:)` before any later ticket is issued, so a read that starts after a flow expired always counts. Wall-clock timestamps can tie, go backwards, or come from a different machine. The ticket makes "issued later" well defined, so a result that lands after an actor suspension can't undo newer evidence. *Trade-off:* ticket order is the client's issue order, not the server's processing order. See the limits below. *Rejected:* serialising all requests per customer, which is correct but turns one slow call into head-of-line blocking for the whole customer.
 - **One actor owns all mutable state.** Routing, reservation and state transitions happen in one actor turn. The only suspension points are the transport call and retry sleeps. *Rejected:* separate actors for state and ledger, which reintroduces a check-then-act race between "can the customer pay?" and "reserve the subsidy".
 - **Reservations, not post-hoc accounting.** An app-paid decision reserves its estimate before sending, and settles to the actual cost after. *Trade-off:* a request whose transport fails releases its reservation and is recorded as "unknown", not spent. If the server actually served it, the ledger under-counts by its real cost.
 - **Probe, don't wait.** The cap is unreadable, so the design pays a small cost (one customer-billed request every 15 min to 6 h while capped) to avoid subsidising a customer who has already raised their cap. *Rejected:* waiting for the month boundary (expensive), and probing every request (it multiplies refused calls and log noise).
@@ -107,12 +107,12 @@ stateDiagram-v2
 - **Fail loudly on caller bugs.** `400 user_profile_required`, other 400s and unknown 403s are returned as `.failed(.rejected)`. They are never covered up by quietly re-sending as `bill_to: "self"`. Falling back there would hide a broken integration behind your own credit card.
 - **Transport errors are not retried.** "Sent, outcome unknown" could mean the request was served and billed. Re-sending could bill twice, so the gateway reports it and the ledger records `unknown`.
 - **UTC month boundaries by integer civil-calendar arithmetic** (Hinnant's algorithms), not `Calendar`. A device-local time zone would shift every cap reset by hours.
-- **Saturating arithmetic throughout.** Costs, budgets, backoffs and timestamps clamp at `Int64` bounds instead of trapping. Hostile inputs (a `retry-after` of `99999999999999999999`, a policy of `Int64.max` ms) are covered by tests.
+- **Saturating arithmetic throughout.** Costs, budgets, backoffs and timestamps clamp at `Int64` bounds instead of trapping. Hostile inputs are covered by tests: a policy of `Int64.max` ms clamps, and a `retry-after` of `99999999999999999999` clamps to an hour (so it is never retried sooner than a smaller value would be).
 
 ## Verification
 
-- **134 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
-- **75 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
+- **144 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
+- **84 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
 - **CI** ([Actions](../../actions)) runs a clean Linux build and tests on Swift 6.0 with warnings as errors, macOS tests plus a generic iOS Simulator build of both products, and the mutation check.
 - **The scripted month the demo plays is tested directly** (`ScriptedMonthTests`), so the numbers in the demo's screenshots are asserted, not hand-copied.
 
@@ -125,7 +125,8 @@ stateDiagram-v2
 - **Batches and streaming aren't modelled.** Message Batches can't bill a customer (the docs say such requests are refused), and the router doesn't know about batches: send them as app-paid. A `billing_unavailable` that arrives mid-stream comes as an error event after a 200, and your transport has to map it to `.refused(.billingUnavailable, partialReply:)`.
 - **Only Anthropic's `503 overloaded_error` is retried**, and only while each wait fits `RetryLimits.maxRetryWaitMillis` (30 s by default). A longer `retry-after` fails the request as `.overloaded` instead of holding the caller. A 503 without that error type (a proxy, a load balancer) may have taken effect, so it decodes to `.other` and isn't retried. 429 and 529 also decode to `.other`. Put your general rate-limit retry policy in the transport.
 - **The OAuth redirect must be https on your proven domain** (docs: every redirect URI is on the domain you prove, except `localhost`). On iOS, `ASWebAuthenticationSession` can receive an https callback with `.https(host:path:)` from iOS 17.4; on 17.0–17.3, let your back end receive the callback and validate `state` there with the same checks. `LinkSession` validates whichever redirect you register; the demo and tests use an https one.
-- **An abandoned link flow expires.** Nothing tells the app when a user closes the sign-in sheet, so a pending link is treated as abandoned after `LinkPolicy.pendingTimeoutMillis` (10 min, the pushed request's lifetime). Read `LinkState.phase(at:)` or `LinkedBillingGateway.currentPhase()` for UI; `phase` itself only moves when an event is applied.
+- **An abandoned link flow expires.** Nothing tells the app when a user closes the sign-in sheet, so a pending link is treated as abandoned after `LinkPolicy.pendingTimeoutMillis` (10 min, the pushed request's lifetime). Read `LinkState.phase(at:)` or `LinkedBillingGateway.currentPhase()` for UI (they also end the ~10 s warm-up on time); `phase` itself only moves when an event is applied.
+- **Reconcile after a cancelled or expired link flow.** A `connected` read that was already in flight when the user started a flow is ambiguous: if it lands before the start it links the profile, and if it lands after, it is stale. Every other ordering is decided by tickets. So after a cancel, call `reconciler.linkCancelled()` (it applies the cancel and takes a fresh read), and after an expiry call `reconcileNow(fresh: true)`.
 - **"A 402 proves the connection was alive" is an inference.** The docs say an ended or unlinked connection is refused with 403 `user_profile_not_billable`; they don't spell out the order of the server's checks. The unlink logic relies on that reading.
 - **`LinkSession` trusts one clock.** Pass `createdAt` from the same clock you pass as `now`. A 60 s tolerance absorbs small adjustments; a back-end timestamp on a device whose clock is minutes behind would expire the callback.
 - **A link found by a status read skips the warm-up.** If `connection_status` reports `connected` for a customer the gateway thought was unlinked (they linked elsewhere), the first `not_billable` inside ~10 s degrades the link instead of being retried.
@@ -137,7 +138,7 @@ stateDiagram-v2
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.4.0")
+.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.5.0")
 ```
 
 ```swift
@@ -159,6 +160,9 @@ let reconciler = ConnectionReconciler(gateway: gateway, source: ProfileStatusSou
 
 let result = await gateway.send(InferenceRequest(feature: summarize, estimate: estimate, prompt: text))
 if result.statusCheckRecommended { _ = await reconciler.reconcileNow(fresh: true) }
+
+// The user closed the sign-in sheet: apply the cancel and read the status afresh.
+_ = await reconciler.linkCancelled()
 
 // Background polling, on the reconciler's phase-aware, jittered cadence.
 Task {
