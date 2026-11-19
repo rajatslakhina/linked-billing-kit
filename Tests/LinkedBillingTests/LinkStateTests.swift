@@ -333,6 +333,59 @@ final class LinkStateTests: XCTestCase {
         guard case .linked(.notBillable) = state.phase else { return XCTFail("\(state.phase)") }
     }
 
+    func testANewerNotBillableThatLandsWhileUnlinkedStillWinsOverAStaleSuccess() {
+        // Read R, then requests A and B. Arrival: R (disconnected), B (403), A (success).
+        var state = billableLink()
+        let read = state.issueTicket()
+        let a = state.issueTicket()
+        let b = state.issueTicket()
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: read), at: t0)
+        state.apply(.customerRefused(.notBillable, ticket: b), at: t0 + 1)
+        state.apply(.customerBilled(ticket: a), at: t0 + 2)
+        guard case .linked(.notBillable) = state.phase else { return XCTFail("\(state.phase)") }
+    }
+
+    func testANewerNegativeReadIsNotUndoneByAnOlderSuccess() {
+        // Read R1, slow request S, polling read R2. Arrival: R1, R2, S, then R1, S, R2.
+        for order in 0..<2 {
+            var state = billableLink()
+            let r1 = state.issueTicket()
+            let slow = state.issueTicket()
+            let r2 = state.issueTicket()
+            let disconnected = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
+            state.apply(.statusObserved(disconnected, ticket: r1), at: t0)
+            if order == 0 {
+                state.apply(.statusObserved(disconnected, ticket: r2), at: t0 + 1)
+                state.apply(.customerBilled(ticket: slow), at: t0 + 2)
+            } else {
+                state.apply(.customerBilled(ticket: slow), at: t0 + 1)
+                state.apply(.statusObserved(disconnected, ticket: r2), at: t0 + 2)
+            }
+            guard case .unlinked(.revokedByAdmin?, _) = state.phase else { return XCTFail("order \(order): \(state.phase)") }
+        }
+    }
+
+    func testAnOlderNegativeReadLandingLateDoesNotReplaceANewerOne() {
+        // R1 < S < R2 by issue order. Arrival: R2, R1, S. The newest evidence is R2.
+        var state = billableLink()
+        let r1 = state.issueTicket()
+        let slow = state.issueTicket()
+        let r2 = state.issueTicket()
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .revokedByAdmin), ticket: r2), at: t0)
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: r1), at: t0 + 1)
+        state.apply(.customerBilled(ticket: slow), at: t0 + 2)
+        XCTAssertEqual(state.phase, .unlinked(reason: .revokedByAdmin, detectedAt: t0))
+    }
+
+    func testANewerConnectedReadOutvotesAnOlderNegativeRead() {
+        var state = billableLink()
+        let negative = state.issueTicket()
+        let positive = state.issueTicket()
+        state.apply(.statusObserved(.connected, ticket: positive), at: t0)
+        state.apply(.statusObserved(.notConnected, ticket: negative), at: t0 + 1)
+        XCTAssertEqual(state.phase, .linked(.billable))
+    }
+
     func testAnOutcomeOlderThanTheReadDoesNotRestore() {
         var state = billableLink()
         let request = state.issueTicket()

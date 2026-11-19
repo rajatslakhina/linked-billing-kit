@@ -95,7 +95,7 @@ stateDiagram-v2
 2. Of two request outcomes, the one **issued** later wins. Arrival order doesn't decide it. A stale success can't clear a newer refusal, and a stale refusal can't undo a newer recovery.
 3. While degraded, at most one probe is in flight. A refusal from an older, non-probe request doesn't cancel it. A probe that never reports expires after `probeTimeoutMillis` (10 min by default; keep it above your transport's request timeout).
 4. A spend-limit probe is never scheduled after 00:00 UTC on the 1st.
-5. `connection_status: unknown` never changes state. `connected` never overrides health observed from requests (the docs say `connected` "doesn't promise that a request will succeed"). A `disconnected` or `not_connected` read issued before a request that proved the connection alive (a success, or a 402, since the API checks the connection first) doesn't unlink, whichever of the two lands first: if the read lands first, the newer outcome restores the link.
+5. `connection_status: unknown` never changes state. `connected` never overrides health observed from requests (the docs say `connected` "doesn't promise that a request will succeed"). A `disconnected` or `not_connected` read issued before a request that proved the connection alive (a success, or a 402, since the API checks the connection first) doesn't unlink. Between a negative read and any proof the connection was alive (a success, a 402, or a `connected` read), the one *issued* later decides, in any arrival order.
 
 ## Design decisions and trade-offs
 
@@ -111,7 +111,7 @@ stateDiagram-v2
 
 ## Verification
 
-- **127 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
+- **131 XCTest tests.** They cover the state machine invariants, the documented error shapes (including a bare 403 that must *not* read as "unlinked"), the router's precedence table, the ledger's reservation and month-boundary behaviour, the gateway's fallbacks and retries, actor-reentrancy races driven by a transport the test controls, single-flight reconciliation, OAuth callback validation, and the scripted month end to end.
 - **73 mutants** in [`scripts/mutation-check.sh`](scripts/mutation-check.sh). Each one puts back a specific bug that this README says the design prevents, for example "drop the stale-success guard" or "stop counting reservations". CI fails if any mutant survives or makes the suite hang, so each listed mutant makes the suite fail rather than pass or hang.
 - **CI** ([Actions](../../actions)) runs a clean Linux build and tests on Swift 6.0 with warnings as errors, macOS tests plus a generic iOS Simulator build of both products, and the mutation check.
 - **The scripted month the demo plays is tested directly** (`ScriptedMonthTests`), so the numbers in the demo's screenshots are asserted, not hand-copied.
@@ -136,7 +136,7 @@ stateDiagram-v2
 ## Use it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.2.1")
+.package(url: "https://github.com/rajatslakhina/linked-billing-kit.git", from: "2.3.0")
 ```
 
 ```swift
