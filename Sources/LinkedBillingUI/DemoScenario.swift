@@ -45,6 +45,8 @@ public final class LinkedBillingDemoModel {
     public private(set) var steps: [DemoStepRecord] = []
     public private(set) var phase: LinkPhase = .notLinked
     public private(set) var totals = SpendTotals()
+    /// Totals for every month with activity, newest first.
+    public private(set) var monthTotals: [(month: BillingMonth, totals: SpendTotals)] = []
     public private(set) var entries: [LedgerEntry] = []
     public private(set) var isRunning = false
     public private(set) var nextStepIndex = 0
@@ -91,6 +93,7 @@ public final class LinkedBillingDemoModel {
         steps = []
         phase = .notLinked
         totals = SpendTotals()
+        monthTotals = []
         entries = []
         nextStepIndex = 0
         requestCounter = 0
@@ -110,9 +113,20 @@ public final class LinkedBillingDemoModel {
     }
 
     public func runAll() async {
-        while !isFinished && !isRunning {
+        await run(steps: Self.script.count)
+    }
+
+    /// Run up to `count` more steps (the demo's `-steps N` launch argument).
+    public func run(steps count: Int) async {
+        var remaining = max(0, count)
+        while remaining > 0, !isFinished, !isRunning {
             await runNextStep()
+            remaining -= 1
         }
+    }
+
+    public func displayName(forFeatureID id: String) -> String {
+        configuration.features.first(where: { $0.id == id })?.displayName ?? id
     }
 
     // MARK: Script
@@ -120,6 +134,7 @@ public final class LinkedBillingDemoModel {
     private enum Action: Sendable {
         case advance(minutes: Int64)
         case setMonthStart(year: Int64, month: Int64)
+        case summarizeMonth(year: Int64, month: Int64)
         case linkViaOAuth(propagationMillis: Int64, capDollars: Int64)
         case orgChange(@Sendable (isolated SimulatedClaudeOrg) -> Void)
         case consoleUnlink
@@ -168,7 +183,8 @@ public final class LinkedBillingDemoModel {
              actions: [.advance(minutes: 30), .request(featureIndex: 0, estimateCents: 300, times: 5)]),
         Step(title: "00:00 UTC, 1 December",
              narrative: "Budgets roll over on the UTC month boundary, not the device's time zone. The allowance covers usage again, and relinking would restore customer billing.",
-             actions: [.setMonthStart(year: 2026, month: 12), .request(featureIndex: 0, estimateCents: 40, times: 1)]),
+             actions: [.summarizeMonth(year: 2026, month: 11), .setMonthStart(year: 2026, month: 12),
+                       .request(featureIndex: 0, estimateCents: 40, times: 1)]),
     ]
 
     private func perform(_ step: Step, index: Int) async -> DemoStepRecord {
@@ -181,6 +197,12 @@ public final class LinkedBillingDemoModel {
                 clock.advance(by: minutes * 60_000)
             case let .setMonthStart(year, month):
                 clock.set(BillingMonth.epochMillis(year: year, month: month, day: 1))
+            case let .summarizeMonth(year, month):
+                let ledger = await gateway.ledger
+                let closedMonth = BillingMonth(containing: BillingMonth.epochMillis(year: year, month: month, day: 1))
+                let closed = ledger.totals(for: closedMonth)
+                note = "\(closedMonth) closed: customer org \(closed.customerBilled), App Store allowance \(closed.appIncluded), subsidy \(closed.appSubsidy) of \(configuration.policy.subsidyPerMonth), app's own usage \(closed.appOperational)."
+
             case let .linkViaOAuth(propagation, cap):
                 note = await link(propagationMillis: propagation, capDollars: cap)
             case let .orgChange(change):
@@ -256,6 +278,7 @@ public final class LinkedBillingDemoModel {
         phase = await gateway.link.phase
         let ledger = await gateway.ledger
         totals = ledger.totals(for: BillingMonth(containing: clock.now()))
+        monthTotals = ledger.months.map { ($0, ledger.totals(for: $0)) }
         entries = ledger.recentEntries
     }
 

@@ -11,12 +11,14 @@ public struct LinkedBillingDemoView: View {
 
     @State private var model: LinkedBillingDemoModel
     @State private var tab: Tab
-    private let autoplay: Bool
+    private let autoplaySteps: Int
 
-    public init(configuration: LinkedBillingDemoConfiguration, initialTab: Tab = .timeline, autoplay: Bool = false) {
+    /// - Parameter autoplaySteps: run this many steps of the scripted month on appear
+    ///   (0 = none; anything above the script length runs the whole month).
+    public init(configuration: LinkedBillingDemoConfiguration, initialTab: Tab = .timeline, autoplaySteps: Int = 0) {
         _model = State(initialValue: LinkedBillingDemoModel(configuration: configuration))
         _tab = State(initialValue: initialTab)
-        self.autoplay = autoplay
+        self.autoplaySteps = max(0, autoplaySteps)
     }
 
     public var body: some View {
@@ -32,7 +34,7 @@ public struct LinkedBillingDemoView: View {
                 .tag(Tab.ledger)
         }
         .task {
-            if autoplay { await model.runAll() }
+            if autoplaySteps > 0 { await model.run(steps: autoplaySteps) }
         }
     }
 }
@@ -219,11 +221,23 @@ struct LedgerScreen: View {
 
     var body: some View {
         List {
-            Section("This UTC month") {
-                StatusHeader(phase: model.phase, now: model.now, totals: model.totals)
-                if model.totals.unknownOutcomes > 0 {
-                    Text("\(model.totals.unknownOutcomes) request(s) with unknown billing (transport failed)")
-                        .font(.caption).foregroundStyle(.orange)
+            if model.monthTotals.isEmpty {
+                Section("This UTC month") {
+                    StatusHeader(phase: model.phase, now: model.now, totals: model.totals)
+                }
+            }
+            ForEach(model.monthTotals, id: \.month) { item in
+                Section("\(item.month.description) (UTC)") {
+                    HStack(spacing: 12) {
+                        Metric(label: "Customer org", value: item.totals.customerBilled.description, tint: .green)
+                        Metric(label: "Included", value: item.totals.appIncluded.description, tint: .blue)
+                        Metric(label: "Subsidy", value: item.totals.appSubsidy.description, tint: .orange)
+                        Metric(label: "App ops", value: item.totals.appOperational.description, tint: .gray)
+                    }
+                    if item.totals.unknownOutcomes > 0 {
+                        Text("\(item.totals.unknownOutcomes) request(s) with unknown billing (transport failed)")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
                 }
             }
             Section {
@@ -233,7 +247,7 @@ struct LedgerScreen: View {
                 ForEach(model.entries) { entry in
                     HStack(alignment: .top) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(entry.featureID).font(.subheadline)
+                            Text(model.displayName(forFeatureID: entry.featureID)).font(.subheadline)
                             Text("\(Format.payer(entry.payer, budget: entry.budget)) · \(entry.model.rawValue)")
                                 .font(.caption).foregroundStyle(.secondary)
                         }

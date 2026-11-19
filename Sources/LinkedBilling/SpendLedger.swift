@@ -101,6 +101,10 @@ public struct SpendLedger: Sendable {
 
     public func totals(for month: BillingMonth) -> SpendTotals { totals[month] ?? SpendTotals() }
 
+    /// Months that have recorded activity, newest first (at most `monthsRetained`,
+    /// plus the current month).
+    public var months: [BillingMonth] { totals.keys.sorted(by: >) }
+
     /// Spent plus currently reserved for `budget` in `month`.
     public func committed(_ budget: AppBudget, in month: BillingMonth) -> MicroUSD {
         totals(for: month).spent(budget) + (reservedTotals[ReservedKey(month: month, budget: budget)] ?? .zero)
