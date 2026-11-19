@@ -178,7 +178,7 @@ Task {
 
 ## Demo app
 
-Demo app: (added after the companion repo is pushed — see below)
+[**linked-billing-kit-demo-app**](https://github.com/rajatslakhina/linked-billing-kit-demo-app) is a SwiftUI app that plays one B2B customer's month (the org pays, hits its cap, then unlinks without telling you) through the real gateway against `SimulatedClaudeOrg`. It depends on this package as a remote, version-pinned SwiftPM dependency, exactly as an integrator would, and its screenshots come from an iOS Simulator run.
 
 ## License
 
