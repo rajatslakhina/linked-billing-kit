@@ -173,6 +173,14 @@ public actor LinkedBillingGateway {
         link.phase(at: clock.now())
     }
 
+    /// Time left before a pending link flow counts as abandoned, or `nil` when no flow
+    /// is pending (or it has already expired).
+    public func millisUntilPendingFlowExpires() -> Int64? {
+        let now = clock.now()
+        guard case let .linkPending(startedAt) = link.phase(at: now) else { return nil }
+        return max(0, Saturating.subtract(Saturating.add(startedAt, link.policy.pendingTimeoutMillis), now))
+    }
+
     /// What the router would decide right now, without sending or reserving.
     public func preview(_ request: InferenceRequest) -> RouteDecision {
         decide(request, at: clock.now())

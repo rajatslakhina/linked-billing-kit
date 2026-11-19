@@ -103,6 +103,8 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertEqual(BillingRefusal.parseRetryAfter("99999999999999999999"), 3600) // too long: clamped, no trap
         XCTAssertEqual(BillingRefusal.parseRetryAfter("99999999999"), 3600)          // 11 digits: still a delay
         XCTAssertEqual(BillingRefusal.parseRetryAfter("9999999999"), 3600)           // 10 digits parse
+        XCTAssertEqual(BillingRefusal.parseRetryAfter("00000000005"), 5)              // leading zeros carry no value
+        XCTAssertEqual(BillingRefusal.parseRetryAfter("000"), 0)
         XCTAssertNil(BillingRefusal.parseRetryAfter("-5"))
         XCTAssertNil(BillingRefusal.parseRetryAfter("Wed, 21 Oct 2026 07:28:00 GMT"))
         XCTAssertNil(BillingRefusal.parseRetryAfter(""))

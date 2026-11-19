@@ -445,29 +445,57 @@ final class LinkStateTests: XCTestCase {
         }
     }
 
-    func testReapprovingAnActiveLinkGivesTheSameStateInEitherArrivalOrder() {
-        // A negative read issued before a re-approval is stale whether it lands before or
-        // after the re-approval starts.
-        var phases: [LinkPhase] = []
-        var admissions: [CustomerAdmission] = []
+    func testRelinkingAfterAReadDetectedUnlinkStartsAPendingFlow() {
+        // The unlink was found by a status read, so `base` is still linked; the relink
+        // must not read as billable before the code exchange.
+        let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
+        var state = billableLink()
+        state.apply(.statusObserved(negative, ticket: state.issueTicket()), at: t0)
+        XCTAssertEqual(state.phase, .unlinked(reason: .revokedByAdmin, detectedAt: t0))
+        state.apply(.linkStarted, at: t0 + 1)
+        XCTAssertEqual(state.phase, .linkPending(startedAt: t0 + 1))
+        XCTAssertEqual(state.admission(at: t0 + 1), .deny(.linkInProgress))
+
+        var cancelled = state
+        cancelled.apply(.linkCancelled, at: t0 + 2)
+        XCTAssertEqual(cancelled.phase, .unlinked(reason: nil, detectedAt: t0 + 2))
+
+        state.apply(.linkCompleted, at: t0 + 3)
+        XCTAssertEqual(state.phase, .linked(.warmingUp(until: t0 + 3 + 10_000)))
+    }
+
+    func testANegativeReadInFlightAtAReapprovalNeverLeavesTheCustomerBilled() {
+        // The read was issued before the user re-approved a link that read as linked.
+        // Landing first, it unlinks and the start begins a flow; landing after, the start
+        // leaves the link in place and the read unlinks it. Both deny the customer, and
+        // completing or cancelling-then-reading gives one state.
+        let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
+        var completed: [LinkPhase] = []
+        var reconciled: [LinkPhase] = []
         for readFirst in [true, false] {
             var state = billableLink()
             let read = state.issueTicket()
-            let negative = ConnectionStatus.disconnected(revokedAt: nil, reason: .revokedByAdmin)
             if readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
             state.apply(.linkStarted, at: t0 + 1)
-            if !readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0 + 2) }
-            phases.append(state.phase)
-            admissions.append(state.admission(at: t0 + 3))
+            if !readFirst { state.apply(.statusObserved(negative, ticket: read), at: t0) }
+            guard case .deny = state.admission(at: t0 + 2) else {
+                return XCTFail("readFirst \(readFirst): customer still admitted: \(state.phase)")
+            }
+            var done = state
+            done.apply(.linkCompleted, at: t0 + 3)
+            completed.append(done.phase)
+            state.apply(.linkCancelled, at: t0 + 3)
+            state.apply(.statusObserved(negative, ticket: state.issueTicket(at: t0 + 4)), at: t0 + 5)
+            reconciled.append(state.phase)
         }
-        XCTAssertEqual(phases, [.linked(.billable), .linked(.billable)])
-        XCTAssertEqual(admissions, [.admit, .admit])
+        XCTAssertEqual(completed, Array(repeating: .linked(.warmingUp(until: t0 + 3 + 10_000)), count: 2))
+        XCTAssertEqual(reconciled, Array(repeating: .unlinked(reason: .revokedByAdmin, detectedAt: t0 + 5), count: 2))
     }
 
     func testAReapprovalDoesNotMakeInFlightRequestOutcomesStale() {
         var state = billableLink()
         let request = state.issueTicket()
-        state.apply(.linkStarted, at: t0)                 // re-approval, link stays
+        state.apply(.linkStarted, at: t0)                 // re-approval of a linked link: stays
         state.apply(.customerRefused(.spendLimitReached, ticket: request), at: t0 + 1)
         guard case .linked(.spendLimitReached) = state.phase else { return XCTFail("\(state.phase)") }
     }

@@ -101,6 +101,19 @@ final class ConnectionReconcilerTests: XCTestCase {
         XCTAssertEqual(phase, .linked(.billable))
     }
 
+    func testThePollingDelayWakesAtAPendingFlowsExpiry() async {
+        let clock = ManualClock(start)
+        let gw = gateway(clock: clock)
+        let reconciler = ConnectionReconciler(gateway: gw, source: ControlledStatusSource())
+        await gw.apply(.linkStarted)
+        clock.advance(by: 4 * 60_000)
+        let pending = await reconciler.nextDelay(jitterDraw: 0)
+        XCTAssertEqual(pending, 6 * 60_000 + 1_000) // not the 24 h pending cadence
+        clock.advance(by: 6 * 60_000)
+        let expired = await reconciler.nextDelay(jitterDraw: 0)
+        XCTAssertGreaterThan(expired, 20 * 3_600_000) // expired: back to the idle cadence
+    }
+
     func testLinkCancelledTakesAFreshReadAfterTheCancel() async {
         // A `connected` read issued before the flow started is stale once the flow
         // starts; `linkCancelled()` replaces it with a read issued after the cancel.

@@ -131,8 +131,11 @@ public enum BillingRefusal: Hashable, Sendable {
     static func parseRetryAfter(_ raw: String?) -> Int64? {
         guard let raw = raw?.trimmingCharacters(in: .whitespaces), !raw.isEmpty,
               raw.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
-        // Ten digits always fit in Int64; anything longer is at least 10^10 s.
-        guard raw.utf8.count <= 10, let seconds = Int64(raw) else { return 3600 }
+        // Leading zeros carry no value ("00000000005" is 5 s).
+        let significant = raw.drop(while: { $0 == "0" })
+        guard !significant.isEmpty else { return 0 }
+        // Ten significant digits always fit in Int64; more is at least 10^10 s.
+        guard significant.utf8.count <= 10, let seconds = Int64(significant) else { return 3600 }
         return min(seconds, 3600)
     }
 

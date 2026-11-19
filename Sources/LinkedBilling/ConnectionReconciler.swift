@@ -14,7 +14,9 @@ public protocol ConnectionStatusSource: Sendable {
 /// a change is likely and matters (a link that just started refusing with
 /// `not_billable`), and slow where nothing is expected. A pending link isn't polled
 /// fast: no status read can complete it (only the code exchange does), and an
-/// abandoned flow expires on its own after `LinkPolicy.pendingTimeoutMillis`. Every delay carries ±10% jitter so a fleet of
+/// abandoned flow expires on its own after `LinkPolicy.pendingTimeoutMillis`.
+/// `ConnectionReconciler.nextDelay` wakes at that expiry, though, so the first read
+/// after an abandoned flow (which may have completed on another device) comes at once. Every delay carries ±10% jitter so a fleet of
 /// clients that started together doesn't poll in lockstep.
 public struct PollSchedule: Hashable, Sendable {
     /// A link flow in progress. Polled like an idle profile (see above).
@@ -122,9 +124,13 @@ public actor ConnectionReconciler {
     }
 
     /// Delay until the next scheduled read, given a random draw for jitter.
+    /// While a link flow is pending, the delay never runs past the flow's expiry (plus
+    /// 1 s), so the first read after an abandoned flow happens without a separate timer.
     public func nextDelay(jitterDraw: UInt64) async -> Int64 {
         let phase = await gateway.currentPhase()
-        return schedule.delay(for: phase, consecutiveFailures: consecutiveFailures, jitterDraw: jitterDraw)
+        let delay = schedule.delay(for: phase, consecutiveFailures: consecutiveFailures, jitterDraw: jitterDraw)
+        guard let remaining = await gateway.millisUntilPendingFlowExpires() else { return delay }
+        return min(delay, Saturating.add(remaining, 1_000))
     }
 
     private func performRead() async -> ReconcileResult {

@@ -46,8 +46,7 @@ public struct LinkPolicy: Hashable, Sendable {
 }
 
 /// Monotonic ordering token. Every request, status read and user action takes one
-/// from the same `LinkState` (including a link start that leaves an active link in
-/// place, and the expiry of an abandoned link flow), so "which happened first" is decided by issue order,
+/// from the same `LinkState` (including the expiry of an abandoned link flow), so "which happened first" is decided by issue order,
 /// never by wall-clock timestamps that can tie or go backwards. This is what makes
 /// results that arrive late (after an actor suspension) safe to apply.
 public struct Ticket: Hashable, Comparable, Sendable {
@@ -137,15 +136,22 @@ public enum LinkEvent: Hashable, Sendable {
 /// ticket-issuing entry point calls first, so the expiry is ordered before any ticket
 /// issued after it and after any ticket issued before it.
 ///
-/// One case is inherently ambiguous and is resolved by a fresh read instead: a
-/// `connected` read issued just *before* the user starts a link flow. If it lands first
-/// it links the profile (and the flow's start leaves the link in place); if the flow
-/// starts first, the read is stale. After a cancel or an expired flow, take a fresh
-/// read (`ConnectionReconciler.linkCancelled()` does both).
+/// Two cases are inherently ambiguous, because a link flow's start doesn't change the
+/// connection a read in flight is reporting on. They are resolved by a fresh read:
+/// - A `connected` read issued just *before* the user starts a link flow. If it lands
+///   first it links the profile (and the flow's start leaves the link in place); if
+///   the flow starts first, the read is stale.
+/// - A negative read issued just before the user starts a flow on a link that still
+///   reads as linked. If it lands first the link reads unlinked and the flow starts
+///   (`.linkPending`); if it lands after, the start leaves the link in place and the
+///   read then unlinks it. Either way the customer is no longer billed.
+/// Completing the flow gives the same state in every order. After a cancel or an
+/// expired flow, take a fresh read (`ConnectionReconciler.linkCancelled()` does both
+/// for a cancel; the reconciler's polling delay wakes at a pending flow's expiry).
 ///
 /// Invariants (each has a test, and a mutant in `scripts/mutation-check.sh`):
-/// 1. A result issued before the latest link/unlink action (or, for a status read,
-///    before a re-approval) never changes `base`, `health` or the evidence. The one
+/// 1. A result issued before the latest link/unlink action never changes `base`,
+///    `health` or the evidence. The one
 ///    thing a stale read still records is that a `disconnected` profile was once
 ///    linked, a permanent fact that decides whether an abandoned flow reads as
 ///    `.notLinked` or `.unlinked`.
@@ -156,7 +162,8 @@ public enum LinkEvent: Hashable, Sendable {
 /// 4. `spend_limit_reached` is never probed later than 00:00 UTC on the 1st.
 /// 5. `connection_status` of `unknown` never changes state; `connected` never
 ///    overrides request-observed health; between a negative read and a request that
-///    proved the connection alive (a success or a 402), the one issued later decides
+///    proved the connection alive (a success, a 402 or a `connected` read), the one
+///    issued later decides
 ///    whether the link reads as unlinked, in any arrival order.
 public struct LinkState: Sendable {
     /// User- and back-end-driven part of the state.
@@ -179,9 +186,6 @@ public struct LinkState: Sendable {
     private var nextSequence: UInt64 = 1
     /// Ticket of the latest link/unlink action. Older results are stale.
     private var authoritative = Ticket(sequence: 0)
-    /// Ticket of the latest link start that left an active link in place (a re-approval).
-    /// Status reads issued before it are stale; request outcomes are not.
-    private var readFloor = Ticket(sequence: 0)
     /// Ticket of the newest request outcome (success or billing refusal) applied.
     private var latestOutcome = Ticket(sequence: 0)
     /// Newest proof the connection was alive when issued: a success, a 402, or a
@@ -363,15 +367,11 @@ public struct LinkState: Sendable {
         settle(at: now)
         switch event {
         case .linkStarted:
-            if case .linked = base {
-                // Re-approving an active link (e.g. a scope change) leaves it in place.
-                // Judged on `base`, not `phase`, so whether an earlier negative read has
-                // landed yet can't change the outcome: reads issued before the
-                // re-approval are stale either way.
-                readFloor = issueTicket()
-                negativeRead = nil
-                break
-            }
+            // Re-approving a link that reads as linked (e.g. a scope change) leaves it in
+            // place: the flow doesn't change the connection. A link that a status read
+            // found unlinked starts a real flow, so it reads `.linkPending` until the
+            // code exchange, not billable.
+            if case .linked = phase { break }
             endUserLevelChange()
             base = .pending(startedAt: now)
         case .linkCompleted:
@@ -395,8 +395,7 @@ public struct LinkState: Sendable {
             // `disconnected` means the profile had a connection that ended: a permanent
             // fact about the profile, recorded even when the read itself is stale.
             if case .disconnected = status { everLinked = true }
-            // Stale if it began before a link/unlink action or a re-approval.
-            guard ticket > max(authoritative, readFloor) else { break }
+            guard ticket > authoritative else { break } // read began before a link/unlink
             applyStatus(status, ticket: ticket, now: now)
         case let .customerRefused(refusal, ticket, sentAt):
             applyRefusal(refusal, ticket: ticket, sentAt: sentAt ?? now, now: now)
