@@ -117,7 +117,8 @@ public enum LinkEvent: Hashable, Sendable {
 /// 3. While degraded, at most one probe is in flight; a lost probe expires.
 /// 4. `spend_limit_reached` is never probed later than 00:00 UTC on the 1st.
 /// 5. `connection_status` of `unknown` never changes state; `connected` never
-///    overrides request-observed health.
+///    overrides request-observed health; a `disconnected`/`not_connected` read issued
+///    before the success that made the link billable doesn't unlink it.
 public struct LinkState: Sendable {
     public private(set) var phase: LinkPhase
     public let policy: LinkPolicy
@@ -149,6 +150,11 @@ public struct LinkState: Sendable {
     }
 
     public var probeInFlight: Bool { probe != nil }
+
+    public var isWarmingUp: Bool {
+        if case .linked(.warmingUp) = phase { return true }
+        return false
+    }
 
     // MARK: Admission
 
@@ -218,7 +224,7 @@ public struct LinkState: Sendable {
             phase = .unlinked(reason: .revokedByAppOwner, detectedAt: now)
         case let .statusObserved(status, ticket):
             guard ticket > authoritative else { break } // read began before a link/unlink
-            applyStatus(status, now: now)
+            applyStatus(status, ticket: ticket, now: now)
         case let .customerRefused(refusal, ticket):
             applyRefusal(refusal, ticket: ticket, now: now)
         case let .customerBilled(ticket):
@@ -229,7 +235,10 @@ public struct LinkState: Sendable {
         return phase != before
     }
 
-    private mutating func applyStatus(_ status: ConnectionStatus, now: EpochMillis) {
+    private mutating func applyStatus(_ status: ConnectionStatus, ticket: Ticket, now: EpochMillis) {
+        // A negative read issued before a request that the customer's org then paid
+        // for is older evidence than that success: don't let it unlink.
+        let olderThanASuccess = ticket < latestOutcome && phaseIsBillable
         switch status {
         case .unknown:
             return
@@ -246,6 +255,7 @@ public struct LinkState: Sendable {
                 phase = .linked(.billable)
             }
         case let .disconnected(_, reason):
+            if olderThanASuccess { return }
             switch phase {
             case .linkPending:
                 return // the old link ended; the new one is in progress
@@ -257,6 +267,7 @@ public struct LinkState: Sendable {
                 phase = .unlinked(reason: reason, detectedAt: now)
             }
         case .notConnected:
+            if olderThanASuccess { return }
             switch phase {
             case .linkPending, .notLinked:
                 return
@@ -285,8 +296,12 @@ public struct LinkState: Sendable {
             return // the docs' ~10 s propagation window: retry, don't degrade
         }
         let wasProbe = probe?.ticket == ticket
-        if wasProbe { failedProbes = min(failedProbes + 1, 16) }
-        clearProbe(resetFailures: false)
+        if wasProbe {
+            failedProbes = min(failedProbes + 1, 16)
+            clearProbe(resetFailures: false)
+        }
+        // A non-probe refusal leaves an in-flight probe in place: that probe is
+        // still the one request allowed to test recovery.
         latestOutcome = ticket
 
         switch refusal {
@@ -314,6 +329,11 @@ public struct LinkState: Sendable {
         latestOutcome = ticket
         clearProbe(resetFailures: true)
         phase = .linked(.billable)
+    }
+
+    private var phaseIsBillable: Bool {
+        if case .linked(.billable) = phase { return true }
+        return false
     }
 
     private mutating func clearProbe(resetFailures: Bool) {

@@ -1,5 +1,6 @@
 import XCTest
 @testable import LinkedBilling
+import LinkedBillingTesting
 
 /// A transport whose calls suspend until the test resolves them, so tests can force
 /// any interleaving of concurrent `send` calls across the actor's suspension points.
@@ -243,15 +244,31 @@ final class GatewayTests: XCTestCase {
     func testAnAppSideRefusalNeverTouchesTheCustomersLink() async {
         let clock = ManualClock(start)
         let org = SimulatedClaudeOrg(clock: clock)
+        await org.link()
         await org.configure { $0.appRefusal = .spendLimitReached }
-        // Not linked: the router goes straight to subsidy.
-        let (gateway, _, _, _) = make(clock: clock, org: org, link: LinkState())
-        let result = await gateway.send(request())
+        // A healthy link, and an app-operational feature: the app pays, and its own
+        // org refuses. That says nothing about the customer.
+        let (gateway, _, _, _) = make(clock: clock, org: org)
+        let ops = FeatureDescriptor(id: "ops", displayName: "Ops", billing: .appOperational, model: "small")
+        let result = await gateway.send(InferenceRequest(feature: ops, estimate: MicroUSD(10_000), prompt: "p"))
         XCTAssertEqual(result.outcome, .failed(.rejected(.spendLimitReached)))
         let phaseNow = await gateway.link.phase
-        XCTAssertEqual(phaseNow, .notLinked)
+        XCTAssertEqual(phaseNow, .linked(.billable))
         let reserved = await gateway.ledger.reservationCount
         XCTAssertEqual(reserved, 0)
+    }
+
+    func testAWarmUpRefusalDoesNotRecommendAStatusRead() async {
+        let clock = ManualClock(start)
+        let org = SimulatedClaudeOrg(clock: clock)
+        await org.configure { $0.propagationMillis = 1_500 }
+        await org.link()
+        var fresh = LinkState()
+        fresh.apply(.linkCompleted, at: start)
+        let (gateway, _, _, _) = make(clock: clock, org: org, link: fresh)
+        let result = await gateway.send(request())
+        XCTAssertEqual(result.attempts.first?.result, .refused(.notBillable, discardedPartialReply: false))
+        XCTAssertFalse(result.statusCheckRecommended)
     }
 
     func testNotBillableRecommendsAStatusRead() async {
@@ -266,7 +283,7 @@ final class GatewayTests: XCTestCase {
     func testPausedRequestsAreNeverSent() async {
         let clock = ManualClock(start)
         let org = SimulatedClaudeOrg(clock: clock)
-        let (gateway, _, _, _) = make(clock: clock, org: org, link: LinkState(), plan: StorePlan.none)
+        let (gateway, _, _, _) = make(clock: clock, org: org, link: LinkState(), plan: .noSubscription)
         let result = await gateway.send(request())
         XCTAssertEqual(result.outcome, .paused(.customerUnavailable(.notLinked)))
         let received = await org.received.count

@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 @testable import LinkedBilling
+import LinkedBillingTesting
 
 /// A status source whose reads suspend until the test releases them.
 actor ControlledStatusSource: ConnectionStatusSource {
@@ -48,6 +49,25 @@ final class ConnectionReconcilerTests: XCTestCase {
         let reads = await source.reads
         XCTAssertEqual(reads, 1)
         XCTAssertEqual(Set(results), [.observed(.connected, phaseChanged: true)])
+    }
+
+    func testAFreshReconcileWaitsOutAnOlderReadAndReadsAgain() async {
+        let clock = ManualClock(start)
+        let source = ControlledStatusSource()
+        let reconciler = ConnectionReconciler(gateway: gateway(clock: clock), source: source)
+        let older = Task { await reconciler.reconcileNow() }
+        await waitUntil { await source.waitingCount == 1 }
+        let fresh = Task { await reconciler.reconcileNow(fresh: true) }
+        for _ in 0..<50 { await Task.yield() }
+        await source.release(.notConnected)             // the older read lands
+        await waitUntil { await source.waitingCount == 1 } // the fresh one starts its own read
+        await source.release(.connected)
+        let olderResult = await older.value
+        let freshResult = await fresh.value
+        XCTAssertEqual(olderResult, .observed(.notConnected, phaseChanged: false))
+        XCTAssertEqual(freshResult, .observed(.connected, phaseChanged: true))
+        let reads = await source.reads
+        XCTAssertEqual(reads, 2)
     }
 
     func testAReadThatStartedBeforeTheUserLinkedCannotRevertTheLink() async {
@@ -205,9 +225,13 @@ final class LinkSessionTests: XCTestCase {
     func testDuplicateParametersAreRejected() throws {
         let session = try session()
         XCTAssertEqual(session.handleCallback(try callback("code=a&state=\(state)&state=\(state)"), at: 2_000),
-                       .rejected(.stateMismatch))
+                       .rejected(.duplicateParameter))
         XCTAssertEqual(session.handleCallback(try callback("code=a&code=b&state=\(state)"), at: 2_001),
-                       .rejected(.missingCode))
+                       .rejected(.duplicateParameter))
+        XCTAssertEqual(session.handleCallback(try callback("error=x&error=y&state=\(state)"), at: 2_002),
+                       .rejected(.duplicateParameter))
+        // None of those consumed the session.
+        XCTAssertEqual(session.handleCallback(try callback("code=ok&state=\(state)"), at: 2_003), .code("ok"))
     }
 
     func testAnExpiredCallbackIsRejectedAndConsumesTheSession() throws {

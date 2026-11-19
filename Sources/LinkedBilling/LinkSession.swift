@@ -49,6 +49,8 @@ public final class LinkSession: @unchecked Sendable {
         case expired
         case alreadyUsed
         case missingCode
+        /// `state`, `code` or `error` appears more than once.
+        case duplicateParameter
     }
 
     public let authorizeURL: URL
@@ -98,17 +100,21 @@ public final class LinkSession: @unchecked Sendable {
         }
 
         let items = components.queryItems ?? []
-        // Exactly one `state`: duplicate parameters are a classic parser-confusion trick.
-        let states = items.filter { $0.name == "state" }
-        guard states.count == 1, let received = states.first?.value,
+        // Duplicate parameters are a classic parser-confusion trick: two parsers can
+        // disagree about which copy counts. Refuse them outright (before `state` is
+        // trusted, so a duplicate doesn't consume the session).
+        for name in ["state", "code", "error"] where items.filter({ $0.name == name }).count > 1 {
+            return .rejected(.duplicateParameter)
+        }
+        guard let received = items.first(where: { $0.name == "state" })?.value,
               Self.constantTimeEquals(received, state) else { return .rejected(.stateMismatch) }
         consumed = true
 
         if let error = items.first(where: { $0.name == "error" })?.value {
             return .denied(error: error)
         }
-        let codes = items.filter { $0.name == "code" }
-        guard codes.count == 1, let code = codes.first?.value, !code.isEmpty, code.utf8.count <= 2_048 else {
+        guard let code = items.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty, code.utf8.count <= 2_048 else {
             return .rejected(.missingCode)
         }
         return .code(code)

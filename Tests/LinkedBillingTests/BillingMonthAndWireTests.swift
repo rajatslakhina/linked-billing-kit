@@ -130,4 +130,9 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertNil(app.headers["anthropic-user-profile-id"])
         XCTAssertEqual(app.billingPolicy["bill_to"], "self")
     }
+
+    func testOtherBetasAreMergedNotOverwritten() {
+        let envelope = BillingEnvelope(payer: .app, additionalBetas: ["tool-x", BillingEnvelope.billingBeta, "tool-x"])
+        XCTAssertEqual(envelope.headers["anthropic-beta"], "user-profiles-billing-2026-10-01,tool-x")
+    }
 }

@@ -25,16 +25,24 @@ public enum Payer: Hashable, Sendable {
     }
 }
 
-/// The headers and body fragment for a billed request. The billing beta header's
-/// value is supplied by you (it is versioned and the docs refer to it as a
-/// constant), so the package never ships a stale one.
+/// The headers and body fragment for a billed request.
 public struct BillingEnvelope: Hashable, Sendable {
+    /// The billing beta in the docs as of November 2026. Versioned: pass a newer value
+    /// to `init` when Anthropic publishes one.
+    public static let billingBeta = "user-profiles-billing-2026-10-01"
+
     public let headers: [String: String]
     /// Merge into the request body as `"billing_policy"`.
     public let billingPolicy: [String: String]
 
-    public init(payer: Payer, betaHeaderValue: String) {
-        var headers = ["anthropic-beta": betaHeaderValue]
+    /// - Parameter additionalBetas: other betas the same request needs (for example
+    ///   for a tool). They're joined into the single `anthropic-beta` header, so the
+    ///   billing beta and yours don't overwrite each other.
+    public init(payer: Payer, betaHeaderValue: String = BillingEnvelope.billingBeta,
+                additionalBetas: [String] = []) {
+        var betas = [betaHeaderValue]
+        for beta in additionalBetas where !betas.contains(beta) { betas.append(beta) }
+        var headers = ["anthropic-beta": betas.joined(separator: ",")]
         if case let .customer(profile) = payer {
             // Required when bill_to is user_profile and the call authenticates as
             // the operator service account; without it the API answers

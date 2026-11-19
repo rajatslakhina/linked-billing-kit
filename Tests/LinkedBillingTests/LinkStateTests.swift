@@ -74,6 +74,16 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.phase, reWarm)
     }
 
+    func testASuccessIssuedBeforeARelinkIsIgnored() {
+        var state = billableLink()
+        let oldRequest = state.issueTicket()
+        state.apply(.unlinkedByApp, at: t0)
+        state.apply(.linkCompleted, at: t0 + 1)              // relinked: warming up again
+        state.apply(.customerBilled(ticket: oldRequest), at: t0 + 2)
+        // The old success says nothing about the new connection's propagation.
+        XCTAssertEqual(state.phase, .linked(.warmingUp(until: t0 + 1 + 10_000)))
+    }
+
     // MARK: Invariant 2: the later-issued outcome wins
 
     func testALateSuccessFromBeforeTheRefusalDoesNotClearIt() {
@@ -122,6 +132,23 @@ final class LinkStateTests: XCTestCase {
         XCTAssertTrue(state.beginProbe(ticket: state.issueTicket(), at: due))
         XCTAssertEqual(state.admission(at: due + 2 * 60_000 - 1), .deny(.notBillable))
         XCTAssertEqual(state.admission(at: due + 2 * 60_000), .probe)
+    }
+
+    func testAStragglerRefusalDoesNotCancelTheProbeInFlight() {
+        var state = billableLink()
+        let first = state.issueTicket()
+        let straggler = state.issueTicket()        // sent before the degradation
+        state.apply(.customerRefused(.spendLimitReached, ticket: first), at: t0)
+        let due = t0 + 15 * 60_000
+        let probe = state.issueTicket()
+        XCTAssertTrue(state.beginProbe(ticket: probe, at: due))
+        state.apply(.customerRefused(.spendLimitReached, ticket: straggler), at: due + 1)
+        XCTAssertTrue(state.probeInFlight)
+        XCTAssertEqual(state.admission(at: due + 2).isProbe, false)
+        // The probe's own refusal still counts toward the backoff (30 min, not 15).
+        state.apply(.customerRefused(.spendLimitReached, ticket: probe), at: due + 3)
+        guard case let .linked(.spendLimitReached(_, next)) = state.phase else { return XCTFail("\(state.phase)") }
+        XCTAssertEqual(next, due + 3 + 30 * 60_000)
     }
 
     func testAnAbandonedProbeFreesTheSlotImmediately() {
@@ -229,6 +256,17 @@ final class LinkStateTests: XCTestCase {
         XCTAssertEqual(state.phase, .linkPending(startedAt: t0 + 1))
     }
 
+    func testANegativeReadIssuedBeforeASuccessDoesNotUnlink() {
+        var state = billableLink()
+        let read = state.issueTicket()             // read starts
+        let request = state.issueTicket()          // a request starts after it…
+        state.apply(.customerBilled(ticket: request), at: t0)  // …and the org pays for it
+        state.apply(.statusObserved(.disconnected(revokedAt: nil, reason: .other), ticket: read), at: t0 + 1)
+        XCTAssertEqual(state.phase, .linked(.billable))
+        state.apply(.statusObserved(.notConnected, ticket: read), at: t0 + 2)
+        XCTAssertEqual(state.phase, .linked(.billable))
+    }
+
     func testNotConnectedAfterTheLinkMeansTheServerNeverSawIt() {
         var state = billableLink()
         state.apply(.statusObserved(.notConnected, ticket: state.issueTicket()), at: t0)
@@ -282,4 +320,8 @@ final class LinkStateTests: XCTestCase {
         guard case let .linked(.billingUnavailable(next)) = state.phase else { return XCTFail("\(state.phase)") }
         XCTAssertEqual(next, .max) // saturated, not wrapped
     }
+}
+
+private extension CustomerAdmission {
+    var isProbe: Bool { self == .probe }
 }

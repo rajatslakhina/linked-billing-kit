@@ -126,7 +126,7 @@ final class BillingRouterTests: XCTestCase {
     }
 
     func testOperationalUsageIsNeverBilledToTheCustomer() {
-        XCTAssertEqual(route(ops, .admit, plan: .none),
+        XCTAssertEqual(route(ops, .admit, plan: .noSubscription),
                        .billApp(model: "small", budget: .operational, reason: .operational, estimate: cents40))
     }
 
@@ -139,14 +139,21 @@ final class BillingRouterTests: XCTestCase {
         let profile = try XCTUnwrap(self.profile)
         XCTAssertEqual(route(chat, .admit, plan: subscriber, ledger: spentLedger(included: .dollars(1))),
                        .billCustomer(profile, model: "big", isProbe: false))
-        XCTAssertEqual(route(chat, .probe, plan: .none),
+        XCTAssertEqual(route(chat, .probe, plan: .noSubscription),
                        .billCustomer(profile, model: "big", isProbe: true))
     }
 
     func testCodeExecutionIsNeverBilledToTheCustomerEvenWhenAdmitted() {
         let decision = route(code, .admit, plan: subscriber, ledger: spentLedger(included: .dollars(1)))
         XCTAssertEqual(decision, .billApp(model: "big", budget: .subsidy, reason: .codeExecutionNotCustomerBillable, estimate: cents40))
-        XCTAssertEqual(route(code, .admit, plan: .none), .pause(.codeExecutionUnfunded))
+        XCTAssertEqual(route(code, .admit, plan: .noSubscription), .pause(.codeExecutionUnfunded))
+    }
+
+    func testCodeExecutionKeepsTheFeaturesOwnModel() {
+        let codeWithCheaper = FeatureDescriptor(id: "c", displayName: "C", model: "big",
+                                                subsidyModel: SubsidyModel("small", costPercent: 20), usesCodeExecution: true)
+        XCTAssertEqual(route(codeWithCheaper, .admit, plan: subscriber, ledger: spentLedger(included: .dollars(1))),
+                       .billApp(model: "big", budget: .subsidy, reason: .codeExecutionNotCustomerBillable, estimate: cents40))
     }
 
     func testARefusedCustomerIsSubsidisedOnTheCheaperModel() {
@@ -156,9 +163,9 @@ final class BillingRouterTests: XCTestCase {
     }
 
     func testSubsidyRequiresASubscriptionByDefault() {
-        XCTAssertEqual(route(chat, .deny(.notBillable), plan: .none), .pause(.customerUnavailable(.notBillable)))
+        XCTAssertEqual(route(chat, .deny(.notBillable), plan: .noSubscription), .pause(.customerUnavailable(.notBillable)))
         let open = RoutingPolicy(subsidyPerMonth: .dollars(3), subsidyRequiresSubscription: false)
-        guard case .billApp(_, .subsidy, _, _) = route(chat, .deny(.notBillable), plan: .none, policy: open) else {
+        guard case .billApp(_, .subsidy, _, _) = route(chat, .deny(.notBillable), plan: .noSubscription, policy: open) else {
             return XCTFail("subsidy should apply when the policy allows free users")
         }
     }
@@ -181,7 +188,7 @@ final class BillingRouterTests: XCTestCase {
     }
 
     func testNoProfileMeansNotLinkedWhateverTheAdmission() {
-        XCTAssertEqual(route(chat, .admit, plan: .none, profile: .some(nil)),
+        XCTAssertEqual(route(chat, .admit, plan: .noSubscription, profile: .some(nil)),
                        .pause(.customerUnavailable(.notLinked)))
     }
 

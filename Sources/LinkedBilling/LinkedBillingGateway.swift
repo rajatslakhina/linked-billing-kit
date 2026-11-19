@@ -120,7 +120,7 @@ public actor LinkedBillingGateway {
     private let sleeper: any BillingSleeper
 
     public init(profile: UserProfileID?, link: LinkState = LinkState(), ledger: SpendLedger = SpendLedger(),
-                plan: StorePlan = .none, policy: RoutingPolicy, limits: RetryLimits = RetryLimits(),
+                plan: StorePlan = .noSubscription, policy: RoutingPolicy, limits: RetryLimits = RetryLimits(),
                 transport: any MessagesTransport, clock: any BillingClock, sleeper: any BillingSleeper) {
         self.profile = profile
         self.link = link
@@ -215,7 +215,9 @@ public actor LinkedBillingGateway {
                                   outcome: .refused(refusal), reservation: nil, at: after)
                     attempts.append(GatewayAttempt(decision: decision,
                                                    result: .refused(refusal, discardedPartialReply: partial != nil)))
-                    if refusal == .notBillable { statusCheck = true }
+                    // Recommend a status read only when the refusal could mean an ended link:
+                    // inside the warm-up window it is expected propagation delay.
+                    if refusal == .notBillable, !link.isWarmingUp { statusCheck = true }
 
                     if case let .overloaded(retryAfter) = refusal {
                         guard overloadRetries < limits.maxOverloadRetries else { return finish(.failed(.overloaded)) }

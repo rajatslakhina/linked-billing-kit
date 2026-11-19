@@ -1,4 +1,5 @@
 import Foundation
+import LinkedBilling
 
 // Deterministic test doubles, public so the demo app and your own tests can use
 // them. They model the documented behaviour of the linked-billing API closely enough

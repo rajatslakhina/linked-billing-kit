@@ -63,7 +63,10 @@ public enum ReconcileResult: Hashable, Sendable {
 
 /// Keeps the gateway's link state honest when nothing tells you a link ended.
 ///
-/// Single-flight: concurrent `reconcileNow()` calls share one read. Each read takes a
+/// Single-flight: concurrent `reconcileNow()` calls share one read. Pass `fresh: true`
+/// when you need a read that *started after* your call (for example right after a
+/// `not_billable`): it waits out any older read in flight and then reads again. Each
+/// read takes a
 /// `Ticket` from the gateway *before* it suspends, so a read that started before the
 /// user re-linked can't revert the new link when it lands (the reentrancy test pins
 /// this).
@@ -83,8 +86,17 @@ public actor ConnectionReconciler {
         self.schedule = schedule
     }
 
-    public func reconcileNow() async -> ReconcileResult {
-        if let inFlight { return await inFlight.task.value }
+    public func reconcileNow(fresh: Bool = false) async -> ReconcileResult {
+        if let current = inFlight {
+            let shared = await current.task.value
+            guard fresh else { return shared }
+            // A read another caller started after `current` began after our call too.
+            if let newer = inFlight, newer.id != current.id { return await newer.task.value }
+        }
+        return await startRead()
+    }
+
+    private func startRead() async -> ReconcileResult {
         let id = nextID
         nextID &+= 1
         let task = Task { await self.performRead() }

@@ -49,7 +49,9 @@ public struct FeatureDescriptor: Hashable, Sendable, Identifiable {
 
 /// What the user has bought through the App Store, as resolved from StoreKit.
 public enum StorePlan: Hashable, Sendable {
-    case none
+    /// No App Store subscription. (Not named `none`, which would collide with
+    /// `Optional.none` wherever a plan is optional.)
+    case noSubscription
     /// A subscription that includes this much Claude usage per UTC month.
     case subscription(includedPerMonth: MicroUSD)
 }
@@ -112,8 +114,8 @@ public enum RouteDecision: Hashable, Sendable {
 /// 2. **Included in the App Store subscription → app**, while the monthly allowance
 ///    lasts. A user who paid Apple for usage is never also billed by their org for it.
 ///    (Code-execution features land here too when the allowance covers them.)
-/// 3. **Code execution → app**, from the subsidy budget (or pause): the API won't
-///    bill a customer for it.
+/// 3. **Code execution → app**, on the feature's own model, from the subsidy budget
+///    (or pause): the API won't bill a customer for it.
 /// 4. **Customer's org can pay → customer.** (`admit` or a due `probe`.)
 /// 5. **Subsidy → app, on the cheaper model**, if the feature and plan are eligible
 ///    and the reservation fits the monthly subsidy budget.
@@ -140,14 +142,17 @@ public enum BillingRouter {
         }
 
         let subsidyAllowed = feature.subsidyEligible
-            && !(policy.subsidyRequiresSubscription && plan == .none)
+            && !(policy.subsidyRequiresSubscription && plan == .noSubscription)
         let (subsidyModel, subsidyCost) = subsidyChoice(feature: feature, estimate: estimate)
         let subsidyFits = ledger.committed(.subsidy, in: month) + subsidyCost <= policy.subsidyPerMonth
 
         if feature.usesCodeExecution {
-            guard subsidyAllowed, subsidyFits else { return .pause(.codeExecutionUnfunded) }
-            return .billApp(model: subsidyModel, budget: .subsidy,
-                            reason: .codeExecutionNotCustomerBillable, estimate: subsidyCost)
+            // Runs on the feature's own model: code execution is a capability choice,
+            // not a request the app may quietly downgrade.
+            let fits = ledger.committed(.subsidy, in: month) + estimate <= policy.subsidyPerMonth
+            guard subsidyAllowed, fits else { return .pause(.codeExecutionUnfunded) }
+            return .billApp(model: feature.model, budget: .subsidy,
+                            reason: .codeExecutionNotCustomerBillable, estimate: estimate)
         }
 
         func pauseOrSubsidy(_ denial: CustomerDenial) -> RouteDecision {
@@ -167,7 +172,7 @@ public enum BillingRouter {
     }
 
     /// The model and estimated cost used when the app subsidises a request.
-    static func subsidyChoice(feature: FeatureDescriptor, estimate: MicroUSD) -> (ModelID, MicroUSD) {
+    public static func subsidyChoice(feature: FeatureDescriptor, estimate: MicroUSD) -> (ModelID, MicroUSD) {
         guard let downgrade = feature.subsidyModel else { return (feature.model, estimate) }
         // costPercent is clamped to 1...100, so the result never exceeds `estimate`;
         // a non-zero estimate never rounds down to a free request.

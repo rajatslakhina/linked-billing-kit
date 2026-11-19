@@ -4,6 +4,8 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
+permissions:
+  contents: read
 jobs:
   linux:
     name: Linux · swift 6.0 · warnings as errors
@@ -26,7 +28,7 @@ jobs:
         run: swift test -Xswiftc -warnings-as-errors
       - name: Build both library products for a generic iOS Simulator
         run: |
-          for scheme in LinkedBilling LinkedBillingUI; do
+          for scheme in LinkedBilling LinkedBillingTesting; do
             xcodebuild build -scheme "$scheme" \
               -destination 'generic/platform=iOS Simulator' \
               CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
